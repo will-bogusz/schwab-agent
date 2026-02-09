@@ -1,0 +1,20 @@
+# Credentials and tokens - NEVER commit these
+config.json
+tokens*.json
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Logs
+*.log
+
+# ngrok binary
+ngrok
