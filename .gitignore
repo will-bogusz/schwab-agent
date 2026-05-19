@@ -1,6 +1,24 @@
+# Credentials and tokens - NEVER commit these
 config.json
-tokens.json
+tokens*.json
+secrets/
+.auth/
+playwright-profile/
+schwab-login.env
+
+# Python-generated files
 __pycache__/
-.venv/
-*.egg-info/
-uv.lock
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Logs
+*.log
+
+# ngrok binary
+ngrok

@@ -1,5 +1,5 @@
 {
-  "client_id": "YOUR_SCHWAB_APP_KEY",
-  "client_secret": "YOUR_SCHWAB_APP_SECRET",
-  "callback_url": "https://YOUR_NGROK_DOMAIN.ngrok-free.app/callback"
+    "client_id": "YOUR_SCHWAB_APP_KEY",
+    "client_secret": "YOUR_SCHWAB_APP_SECRET",
+    "callback_url": "https://YOUR_NGROK_URL.ngrok-free.app/callback"
 }

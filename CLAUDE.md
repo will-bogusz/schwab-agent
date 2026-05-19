@@ -1,174 +1,118 @@
-# schwab-agent
+# Schwab API — Reference
 
-## On Session Start
+See `../CLAUDE.md` for all command syntax, order templates, and field reference.
 
-1. Check if `config.json` exists. If not, start the Setup Wizard below.
-2. If config exists, check auth: `uv run schwab auth`
-3. If auth fails, guide re-authentication (see Re-Auth below).
+## OAuth Flow
 
-The user is non-technical. Explain things simply, confirm each step before moving on.
+Two apps with independent tokens:
 
-Full setup instructions, platform-specific install commands, and troubleshooting are in `README.md` — read it when needed rather than guessing.
+| App | Token File |
+|-----|------------|
+| `market` | `tokens_market.json` |
+| `trading` | `tokens_trading.json` |
 
----
+- Access tokens: 30 minutes (auto-refresh by schwab-py)
+- Refresh tokens: 7 days (re-authenticate after expiry)
+- Manual/cron refresh: `uv run schwab-refresh --app all`
+- Refresh plus browser fallback: `uv run schwab-auth-keepalive --app all --browser-fallback --headless`
 
-## Setup Wizard
+### Re-authentication Steps
 
-When setup is needed, follow this flow. Detect the OS first (`uname` or platform check), then work through each phase.
+1. Start SSH tunnel: `ssh -R 9000:localhost:8000 -N goliath`
+2. Start auth server: `cd schwab && uv run schwab-server`
+3. Visit `http://localhost:8000` and authenticate each app
+4. Callback URL: `https://goliath.tailffd98c.ts.net/callback`
 
-### Phase 1: Prerequisites (agent can automate)
+### Always-On Refresh
 
-Check and install each tool. Run the check command — if it fails, install it. See README.md for platform-specific install commands (Mac/Windows/Linux sections).
+Use `uv run schwab-refresh --app all` from the Schwab package directory to
+refresh both token files without running the OAuth web server. This is the
+right command for launchd, cron, or a systemd timer. On each successful refresh,
+the token timestamp is reset so the local 7-day refresh window tracks the newly
+issued Schwab refresh token.
 
-| Tool | Check | Notes |
-|------|-------|-------|
-| Python 3.10+ | `python3 --version` | brew / apt / python.org installer |
-| uv | `uv --version` | brew / curl / powershell |
-| ngrok | `ngrok version` | brew / apt / choco |
+Use `uv run schwab-auth-keepalive --app all --browser-fallback --headless` for
+the goliath timer. It refreshes first and only runs the Playwright login flow
+when refresh fails.
 
-After all tools pass, run `uv sync` to install project dependencies.
+### Browser Login Fallback
 
-### Phase 2: Account setup (requires user in browser)
-
-These steps require the user to interact with websites. Guide them through each one, then ask them to provide the resulting values.
-
-1. **Schwab developer account + app** — This is a separate account from their brokerage login. User must:
-   - Create a developer account at https://developer.schwab.com/ (if they don't have one)
-   - Go to https://developer.schwab.com/dashboard/apps and click Create App
-   - Select **both** API products: "Accounts and Trading Production" AND "Market Data Production"
-   - Fill in App Name (anything), leave Callback URL blank for now (filled in after ngrok setup)
-   - Ask them for the **App Key** and **Secret** when done
-   - **App requires Schwab approval** — not instant. Could take minutes to days. Status shows "Ready" when approved. 403 errors before approval are expected.
-
-2. **ngrok account** — User must visit https://dashboard.ngrok.com/signup, then:
-   - Copy their auth token → agent runs `ngrok config add-authtoken TOKEN`
-   - Claim a free static domain at https://dashboard.ngrok.com/domains → ask user for the domain name
-
-3. **Set callback URL** — User must go back to the Schwab developer portal and set the app's callback URL to `https://THEIR-DOMAIN.ngrok-free.app/callback`
-
-### Phase 3: Configuration (agent can automate)
-
-Once the user provides their credentials, create `config.json`:
+Credential handoff is via a local chmod-600 env file. Create it with:
 
 ```bash
-cp config.example.json config.json
+uv run schwab-secrets write
 ```
 
-Then write the values into it:
-```json
-{
-  "client_id": "their App Key",
-  "client_secret": "their Secret",
-  "callback_url": "https://THEIR-DOMAIN.ngrok-free.app/callback"
-}
+The command prompts for username and a hidden password, then writes
+`secrets/schwab-login.env` by default. Do not print, cat, or commit that file.
+
+Manual fallback test:
+
+```bash
+uv run schwab-browser-auth --app all --headed
 ```
 
-### Phase 4: First authentication (mixed)
+For the goliath-hosted setup, see `deploy/goliath/`.
 
-This requires two processes running simultaneously. The agent can start them, but the user must complete the browser auth.
+## App Selection
 
-1. Agent starts ngrok: `ngrok http 8000 --url=THEIR-DOMAIN.ngrok-free.app`
-2. Agent starts auth server: `uv run schwab-auth`
-3. Tell the user to open http://localhost:8000 and click **Authenticate**
-4. User logs into Schwab and authorizes the app
-5. After user confirms success, stop both processes
-6. Verify: `uv run schwab auth`
+- **schwab CLI**: Smart defaults — `quote`/`options`/`history`/`movers`/`hours`/`search` use market app, others use trading app
+- **schwab-api**: Defaults to trading, override with `--app market`
+- **Python**: `from schwab_agent.client import get_client; get_client("market")`
 
----
+## CLI Commands
 
-## Re-Auth (Every 7 Days)
+| Command | Description | Default App |
+|---------|-------------|-------------|
+| `schwab quote <symbols>` | Session-aware Schwab quotes with regular/extended/reference/fundamental fields | market |
+| `schwab technical <symbol>` | Intraday technical snapshot: VWAP, ranges, volume, SMA/EMA | market |
+| `schwab options-eval <symbol>` | Outright call and call-spread scenarios with liquidity metrics | market |
+| `schwab positions` | Account positions | trading |
+| `schwab balances` | Account balances | trading |
+| `schwab orders` | Show orders | trading |
+| `schwab options <symbol>` | Raw/summary option chain | market |
+| `schwab auth` | Check token status | trading |
+| `schwab accounts` | List linked accounts | trading |
+| `schwab order` | Place order via OrderBuilder | trading |
+| `schwab preview` | Server-side order preview | trading |
+| `schwab cancel` | Cancel an order | trading |
+| `schwab replace` | Replace an order | trading |
+| `schwab expirations <symbol>` | Option expiration chain | market |
+| `schwab history <symbol>` | Price history | market |
+| `schwab transactions` | Account transactions | trading |
+| `schwab movers` | Market movers | market |
+| `schwab hours` | Market hours | market |
+| `schwab search <query>` | Search instruments | market |
+| `schwab instrument <cusip>` | Instrument by CUSIP | market |
 
-When commands fail with auth errors, the refresh token has expired.
+Schwab is the primary source for US live quotes, US options, intraday
+technicals, extended-session marks, and Schwab account state. Polygon is only a
+historical/bulk fallback for US data. yfinance is only a labeled fallback for
+foreign, TSXV, KRX, FX, macro, or other assets Schwab does not cover well.
 
-1. Start ngrok: `ngrok http 8000 --url=THEIR-DOMAIN.ngrok-free.app`
-2. Start server: `uv run schwab-auth`
-3. Tell user to open http://localhost:8000 and click Authenticate
-4. After success, stop both and verify with `uv run schwab auth`
+## Files
 
-The user's ngrok domain is in `config.json` under `callback_url`.
-
----
-
-## Commands
-
-### Market Data
-
-| Task | Command |
-|------|---------|
-| Stock quote | `uv run schwab quote AAPL GOOGL` |
-| Quote with fields | `uv run schwab quote AAPL --fields fundamental` |
-| Option chain | `uv run schwab options AAPL` |
-| Options (filtered) | `uv run schwab options AAPL --calls --expiry 20250321 --strikes 5` |
-| Option expirations | `uv run schwab expirations AAPL` |
-| Price history | `uv run schwab history AAPL --daily --from 2025-01-01` |
-| Market movers | `uv run schwab movers --index SPX` |
-| Market hours | `uv run schwab hours --market equity` |
-| Search instruments | `uv run schwab search AAPL --projection fundamental` |
-| Instrument by CUSIP | `uv run schwab instrument 037833100` |
-
-### Account
-
-| Task | Command |
-|------|---------|
-| Check auth | `uv run schwab auth` |
-| List accounts | `uv run schwab accounts` |
-| Positions | `uv run schwab positions` |
-| Balances | `uv run schwab balances` |
-| Orders | `uv run schwab orders` |
-| Orders (filtered) | `uv run schwab orders --status filled --days 30` |
-| Transactions | `uv run schwab transactions --type TRADE` |
-
-### Order Execution (CLI)
-
-| Task | Command |
-|------|---------|
-| Preview order | `uv run schwab order --action BUY --symbol AAPL --qty 10 --type LIMIT --price 150` |
-| Execute order | `uv run schwab order --action BUY --symbol AAPL --qty 10 --type LIMIT --price 150 --confirm` |
-| Cancel order | `uv run schwab cancel --order-id 123456 --confirm` |
-| Replace order | `uv run schwab replace --order-id 123456 --data '{...}' --confirm` |
-| Server preview | `uv run schwab preview --data '{...}'` |
-
-### Order Execution (Raw JSON — schwab-api)
-
-For complex multi-leg/OCO/trigger orders:
-
-| Task | Command |
-|------|---------|
-| Place order | `uv run schwab-api place --data '{...}' --confirm` |
-| Preview order | `uv run schwab-api preview --data '{...}'` |
-| Cancel order | `uv run schwab-api cancel --order-id 123456 --confirm` |
-| Replace order | `uv run schwab-api replace --order-id 123456 --data '{...}' --confirm` |
-
-### Global Flags
-
-- `--raw` — JSON output (on any command)
-- `--account ID` — account identifier: index (`1`, `2`), account number, or hash prefix (on account commands)
-
----
-
-## Order Safety Rules
-
-1. **Always preview first** — run without `--confirm` to see what would happen
-2. **Check the quote** — `uv run schwab quote SYMBOL` before any order
-3. **Confirm with the user** — never execute an order without explicit user approval
-
-Automatic safety limits: 10,000 shares max, 100 contracts max, 20% limit price deviation warning.
-
----
-
-## Config Resolution
-
-Config is found in this order:
-1. `SCHWAB_AGENT_DIR` environment variable
-2. Walk up from CWD looking for `config.json` with `client_id` or `callback_url`
-3. `~/.config/schwab-agent/`
-
-This means commands work from any directory when `SCHWAB_AGENT_DIR` is set.
-
----
-
-## Token Lifecycle
-
-- Access tokens: 30 min (auto-refreshed by schwab-py, no action needed)
-- Refresh tokens: 7 days (re-authentication required after expiry)
-- Re-auth requires ngrok + schwab-auth running simultaneously
+```
+schwab/
+├── config.json              # Multi-app credentials and callback URL (gitignored)
+├── secrets/                 # Browser-login env file (gitignored, chmod 600)
+├── .auth/                   # Playwright persistent profile (gitignored)
+├── tokens_market.json       # OAuth tokens for market data app
+├── tokens_trading.json      # OAuth tokens for trading app
+├── pyproject.toml           # Dependencies + entry points (schwab, schwab-api, schwab-server)
+├── deploy/goliath/          # Optional always-on OAuth host units
+└── src/schwab_agent/
+    ├── __init__.py           # Version (0.2.0)
+    ├── config.py             # Config/path resolution
+    ├── client.py             # Resilient multi-app client factory + 401 refresh retry
+    ├── market.py             # Normalized quote/session model
+    ├── technical.py          # Schwab history technical snapshots
+    ├── options_eval.py       # Options/scenario evaluation helpers
+    ├── stream_cache.py       # Read-only streaming cache daemon
+    ├── output.py             # Formatting helpers (fmt_table, fmt_currency, emit)
+    ├── orders.py             # OrderBuilder wrapper + safety checks
+    ├── cli.py                # 18-command CLI (entry point: schwab)
+    ├── api.py                # Raw JSON order API (entry point: schwab-api)
+    ├── browser_auth.py       # Browser fallback + secret writer
+    └── server.py             # OAuth server (entry point: schwab-server)
+```

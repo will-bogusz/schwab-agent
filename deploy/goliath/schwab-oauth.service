@@ -1,0 +1,14 @@
+[Unit]
+Description=Schwab OAuth callback server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tmp/schwab
+Environment=SCHWAB_AGENT_DIR=%h/tmp/schwab
+ExecStart=%h/.local/bin/uv run schwab-server --port 9000
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

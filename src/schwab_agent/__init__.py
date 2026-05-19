@@ -1,3 +1,3 @@
-"""Schwab Trading Tools — programmatic access to Schwab brokerage accounts."""
+"""schwab-agent: Ergonomic CLI for the Schwab API."""
 
 __version__ = "0.2.0"

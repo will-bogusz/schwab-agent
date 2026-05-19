@@ -1,66 +1,86 @@
+#!/usr/bin/env python3
 """
 Schwab OAuth Server
 -------------------
-Handles OAuth authentication with Schwab's API.
+Multi-app OAuth server supporting separate authentication for market data and trading APIs.
 
 Usage:
-    uv run schwab-auth [--port PORT]
+    schwab-server [--port PORT]
 
-Then visit http://localhost:8000 to authenticate.
+Then visit:
+    http://localhost:8000/login/market   - Authenticate market data app
+    http://localhost:8000/login/trading   - Authenticate trading app
 """
 
 import json
+import sys
 import time
 import base64
 import argparse
 from datetime import datetime
 from urllib.parse import urlencode
-from flask import Flask, request, redirect, jsonify
+
 import httpx
+from flask import Flask, request, redirect, jsonify
 
 from . import config
 
-flask_app = Flask(__name__)
+app = Flask(__name__)
 
 SCHWAB_AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize"
 SCHWAB_TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 
 
-def load_tokens() -> dict | None:
-    token_path = config.get_token_path()
-    if not token_path.exists():
+def load_tokens(app_name: str) -> dict | None:
+    """Load tokens for an app, handling nested format."""
+    path = config.get_token_path(app_name)
+    if not path.exists():
         return None
-    with open(token_path) as f:
+    with open(path) as f:
         data = json.load(f)
         return data.get("token", data)
 
 
-def load_tokens_raw() -> dict | None:
-    token_path = config.get_token_path()
-    if not token_path.exists():
+def load_tokens_raw(app_name: str) -> dict | None:
+    """Load raw token file including metadata."""
+    path = config.get_token_path(app_name)
+    if not path.exists():
         return None
-    with open(token_path) as f:
+    with open(path) as f:
         return json.load(f)
 
 
-def save_tokens(tokens: dict):
-    """Save tokens in schwab-py compatible format."""
-    token_path = config.get_token_path()
-    tokens["creation_timestamp"] = int(time.time())
-    with open(token_path, "w") as f:
-        json.dump(tokens, f, indent=2)
-    print(f"  Tokens saved to {token_path.resolve()}")
+def wrap_tokens(tokens: dict, creation_timestamp: int | None = None) -> dict:
+    """Wrap raw OAuth tokens in the metadata format expected by schwab-py."""
+    if "token" in tokens:
+        return tokens
+
+    token = {k: v for k, v in tokens.items() if k != "creation_timestamp"}
+    return {
+        "creation_timestamp": creation_timestamp or tokens.get("creation_timestamp") or int(time.time()),
+        "token": token,
+    }
+
+
+def save_tokens(app_name: str, tokens: dict, creation_timestamp: int | None = None):
+    """Save tokens in schwab-py's metadata-wrapped format."""
+    path = config.get_token_path(app_name)
+    with open(path, "w") as f:
+        json.dump(wrap_tokens(tokens, creation_timestamp=creation_timestamp), f, indent=2)
+    print(f"  Tokens saved to {path}", file=sys.stderr)
 
 
 def get_basic_auth(client_id: str, client_secret: str) -> str:
+    """Create Basic Auth header value."""
     credentials = f"{client_id}:{client_secret}"
     encoded = base64.b64encode(credentials.encode()).decode()
     return f"Basic {encoded}"
 
 
-def get_token_status() -> dict:
-    tokens = load_tokens()
-    raw = load_tokens_raw()
+def get_token_status(app_name: str) -> dict:
+    """Get token status for an app."""
+    tokens = load_tokens(app_name)
+    raw = load_tokens_raw(app_name)
 
     if not tokens:
         return {"exists": False, "valid": False, "status": "missing"}
@@ -87,63 +107,65 @@ def get_token_status() -> dict:
     return {"exists": True, "valid": True, "status": "unknown_expiry"}
 
 
-@flask_app.route("/")
+@app.route("/")
 def home():
+    """Home page showing status of all apps."""
     cfg = config.load_config()
-    status = get_token_status()
 
-    status_icon = {
-        "valid": "&#x1f7e2;",
-        "needs_refresh": "&#x1f7e1;",
-        "refresh_expired": "&#x1f534;",
-        "missing": "&#x26aa;",
-        "unknown_expiry": "&#x1f7e2;",
-    }.get(status["status"], "?")
+    apps_html = ""
+    for app_name in config.VALID_APPS:
+        status = get_token_status(app_name)
+        status_icon = {
+            "valid": "🟢",
+            "needs_refresh": "🟡",
+            "refresh_expired": "🔴",
+            "missing": "⚪",
+            "unknown_expiry": "🟢",
+        }.get(status["status"], "❓")
 
-    status_text = {
-        "valid": f"Valid until {status.get('access_expires', 'N/A')[:19]}",
-        "needs_refresh": "Access expired, will auto-refresh on next use",
-        "refresh_expired": "Expired - re-authentication required",
-        "missing": "Not authenticated yet",
-        "unknown_expiry": "Authenticated (unknown expiry)",
-    }.get(status["status"], status["status"])
+        status_text = {
+            "valid": f"Valid until {status.get('access_expires', 'N/A')[:19]}",
+            "needs_refresh": "Access expired, will auto-refresh",
+            "refresh_expired": "Re-authentication required",
+            "missing": "Not authenticated",
+            "unknown_expiry": "Authenticated (unknown expiry)",
+        }.get(status["status"], status["status"])
 
-    refresh_expires = status.get("refresh_expires", "N/A")
-    refresh_text = f"<p class='detail'>Refresh token expires: {refresh_expires[:19]}</p>" if refresh_expires != "N/A" else ""
+        apps_html += f"""
+        <div class="app-card">
+            <h3>{status_icon} {app_name.title()}</h3>
+            <p class="status">{status_text}</p>
+            <a href="/login/{app_name}" class="btn">Authenticate</a>
+            <a href="/refresh/{app_name}" class="btn btn-secondary">Refresh</a>
+        </div>
+        """
 
     return f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Schwab OAuth</title>
+        <title>Schwab OAuth Server</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                   max-width: 600px; margin: 50px auto; padding: 20px; background: #f5f5f5; }}
+                   max-width: 800px; margin: 50px auto; padding: 20px; background: #f5f5f5; }}
             h1 {{ color: #333; }}
-            .card {{ background: white; padding: 20px; border-radius: 8px; margin: 15px 0;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+            .app-card {{ background: white; padding: 20px; border-radius: 8px; margin: 15px 0;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+            .app-card h3 {{ margin-top: 0; }}
             .status {{ color: #666; font-size: 14px; }}
-            .detail {{ color: #999; font-size: 12px; margin-top: 4px; }}
-            .btn {{ display: inline-block; padding: 10px 20px; border-radius: 4px; text-decoration: none;
-                   margin-right: 8px; font-size: 14px; color: white; }}
-            .btn-primary {{ background: #0066cc; }}
-            .btn-primary:hover {{ background: #0052a3; }}
+            .btn {{ display: inline-block; padding: 8px 16px; border-radius: 4px; text-decoration: none;
+                   margin-right: 8px; font-size: 14px; }}
+            .btn {{ background: #0066cc; color: white; }}
+            .btn:hover {{ background: #0052a3; }}
             .btn-secondary {{ background: #6c757d; }}
             .btn-secondary:hover {{ background: #5a6268; }}
-            .info {{ background: #e7f3ff; padding: 15px; border-radius: 8px; margin-top: 20px; font-size: 14px; }}
+            .info {{ background: #e7f3ff; padding: 15px; border-radius: 8px; margin-top: 20px; }}
             code {{ background: #eee; padding: 2px 6px; border-radius: 3px; }}
         </style>
     </head>
     <body>
-        <h1>Schwab OAuth</h1>
-        <div class="card">
-            <h3>{status_icon} Authentication Status</h3>
-            <p class="status">{status_text}</p>
-            {refresh_text}
-            <br>
-            <a href="/login" class="btn btn-primary">Authenticate</a>
-            <a href="/refresh" class="btn btn-secondary">Refresh Token</a>
-        </div>
+        <h1>Schwab OAuth Server</h1>
+        {apps_html}
         <div class="info">
             <strong>Callback URL:</strong> <code>{cfg['callback_url']}</code>
         </div>
@@ -152,63 +174,85 @@ def home():
     """
 
 
-@flask_app.route("/login")
-def login():
-    cfg = config.load_config()
+@app.route("/login/<app_name>")
+def login(app_name: str):
+    """Start OAuth flow for an app."""
+    if app_name not in config.VALID_APPS:
+        return jsonify({"error": f"Invalid app. Must be one of: {config.VALID_APPS}"}), 400
+
+    app_config = config.get_app_config(app_name)
+
     params = {
-        "client_id": cfg["client_id"],
-        "redirect_uri": cfg["callback_url"],
+        "client_id": app_config["client_id"],
+        "redirect_uri": app_config["callback_url"],
+        "state": app_name,
     }
+
     auth_url = f"{SCHWAB_AUTH_URL}?{urlencode(params)}"
-    print(f"\n  Starting OAuth flow")
+    print(f"\n  Starting OAuth for '{app_name}'")
     print(f"  Redirecting to: {auth_url[:80]}...")
+
     return redirect(auth_url)
 
 
-@flask_app.route("/callback")
+@app.route("/callback")
 def callback():
+    """Handle OAuth callback."""
     code = request.args.get("code")
+    state = request.args.get("state")
     error = request.args.get("error")
 
     if error:
         return jsonify({"error": error, "description": request.args.get("error_description")}), 400
+
     if not code:
         return jsonify({"error": "Missing authorization code"}), 400
 
-    print(f"\n  Received callback with authorization code")
-    cfg = config.load_config()
+    # Require a valid state — silent fallback to "market" could let a trading-app
+    # auth code overwrite market tokens if state is tampered or absent.
+    if not state or state not in config.VALID_APPS:
+        return jsonify({
+            "error": "Invalid or missing OAuth state parameter",
+            "expected": list(config.VALID_APPS),
+            "got": state,
+        }), 400
+    app_name = state
+    print(f"\n  Received callback for '{app_name}'")
+
+    app_config = config.get_app_config(app_name)
 
     headers = {
-        "Authorization": get_basic_auth(cfg["client_id"], cfg["client_secret"]),
+        "Authorization": get_basic_auth(app_config["client_id"], app_config["client_secret"]),
         "Content-Type": "application/x-www-form-urlencoded",
     }
     data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": cfg["callback_url"],
+        "redirect_uri": app_config["callback_url"],
     }
 
     resp = httpx.post(SCHWAB_TOKEN_URL, headers=headers, data=data)
 
     if resp.status_code == 200:
         tokens = resp.json()
-        save_tokens(tokens)
-        return """
+        save_tokens(app_name, tokens)
+
+        return f"""
         <!DOCTYPE html>
         <html>
         <head>
             <title>Success</title>
             <style>
-                body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 50px auto;
-                       padding: 20px; text-align: center; }
-                .success { color: #28a745; font-size: 64px; }
+                body {{ font-family: -apple-system, sans-serif; max-width: 600px; margin: 50px auto;
+                       padding: 20px; text-align: center; }}
+                .success {{ color: #28a745; font-size: 64px; }}
             </style>
         </head>
         <body>
-            <div class="success">&#x2713;</div>
-            <h1>Authenticated Successfully</h1>
+            <div class="success">✓</div>
+            <h1>{app_name.title()} App Authenticated</h1>
             <p>Tokens saved. You can close this window.</p>
-            <p><a href="/">&#8592; Back</a></p>
+            <p><a href="/">← Back</a></p>
         </body>
         </html>
         """
@@ -218,15 +262,27 @@ def callback():
         return jsonify({"error": "Token exchange failed", "details": resp.text}), 500
 
 
-@flask_app.route("/refresh")
-def refresh():
-    tokens = load_tokens()
-    if not tokens or not tokens.get("refresh_token"):
-        return jsonify({"error": "No refresh token. Please authenticate first."}), 400
+@app.route("/refresh/<app_name>")
+def refresh(app_name: str):
+    """Refresh tokens for an app."""
+    result = refresh_tokens(app_name)
+    status_code = 200 if result.get("status") == "success" else 400
+    return jsonify(result), status_code
 
-    cfg = config.load_config()
+
+def refresh_tokens(app_name: str) -> dict:
+    """Refresh tokens for an app without requiring the Flask request path."""
+    if app_name not in config.VALID_APPS:
+        return {"status": "error", "app": app_name, "error": f"Invalid app. Must be one of: {config.VALID_APPS}"}
+
+    tokens = load_tokens(app_name)
+    if not tokens or not tokens.get("refresh_token"):
+        return {"status": "error", "app": app_name, "error": "No refresh token. Please authenticate first."}
+
+    app_config = config.get_app_config(app_name)
+
     headers = {
-        "Authorization": get_basic_auth(cfg["client_id"], cfg["client_secret"]),
+        "Authorization": get_basic_auth(app_config["client_id"], app_config["client_secret"]),
         "Content-Type": "application/x-www-form-urlencoded",
     }
     data = {
@@ -238,16 +294,37 @@ def refresh():
 
     if resp.status_code == 200:
         new_tokens = resp.json()
-        save_tokens(new_tokens)
-        return jsonify({"status": "success", "expires_in": new_tokens.get("expires_in")})
-    else:
-        return jsonify({"error": "Refresh failed", "details": resp.text}), 500
+        # Schwab returns a fresh refresh token on refresh. Reset the timestamp so
+        # local status tracks the new 7-day refresh window, not the original
+        # browser-auth time. If Schwab ever omits refresh_token, keep the prior
+        # token but do not pretend the refresh window was extended.
+        if new_tokens.get("refresh_token"):
+            creation_timestamp = int(time.time())
+        else:
+            raw = load_tokens_raw(app_name) or {}
+            new_tokens["refresh_token"] = tokens["refresh_token"]
+            creation_timestamp = raw.get("creation_timestamp")
+        save_tokens(app_name, new_tokens, creation_timestamp=creation_timestamp)
+        return {"status": "success", "app": app_name, "expires_in": new_tokens.get("expires_in")}
+    return {"status": "error", "app": app_name, "error": "Refresh failed", "details": resp.text}
 
 
-@flask_app.route("/status")
+@app.route("/status")
 def status():
+    """Return status of all apps as JSON."""
     cfg = config.load_config()
-    return jsonify({"callback_url": cfg["callback_url"], **get_token_status()})
+    result = {
+        "callback_url": cfg["callback_url"],
+        "apps": {},
+    }
+
+    for app_name in config.VALID_APPS:
+        result["apps"][app_name] = get_token_status(app_name)
+        result["apps"][app_name]["client_id_set"] = bool(
+            cfg["apps"].get(app_name, {}).get("client_id")
+        )
+
+    return jsonify(result)
 
 
 def main():
@@ -262,11 +339,43 @@ def main():
     cfg = config.load_config()
     print(f"\nCallback URL: {cfg['callback_url']}")
 
-    tok_status = get_token_status()
-    icon = "OK" if tok_status["valid"] else "EXPIRED" if tok_status["exists"] else "MISSING"
-    print(f"  Token status: {icon} ({tok_status['status']})")
+    for app_name in config.VALID_APPS:
+        st = get_token_status(app_name)
+        icon = "✓" if st["valid"] else "✗"
+        print(f"  {icon} {app_name}: {st['status']}")
 
     print(f"\nServer: http://localhost:{args.port}")
     print("=" * 50)
 
-    flask_app.run(host="0.0.0.0", port=args.port, debug=False)
+    # Bind to localhost only — expose via SSH tunnel (see CLAUDE.md OAuth Flow).
+    # 0.0.0.0 would put /refresh/<app> on every network interface during auth.
+    app.run(host="127.0.0.1", port=args.port, debug=False)
+
+
+def refresh_main():
+    """CLI entry point for cron/systemd/launchd token keepalive."""
+    parser = argparse.ArgumentParser(description="Refresh Schwab OAuth tokens")
+    parser.add_argument(
+        "--app",
+        choices=[*config.VALID_APPS, "all"],
+        default="all",
+        help="App to refresh (default: all)",
+    )
+    args = parser.parse_args()
+
+    apps = list(config.VALID_APPS) if args.app == "all" else [args.app]
+    ok = True
+    for app_name in apps:
+        result = refresh_tokens(app_name)
+        if result.get("status") == "success":
+            print(f"{app_name}: refreshed ({result.get('expires_in')}s access token)")
+        else:
+            ok = False
+            print(f"{app_name}: refresh failed - {result.get('error')}")
+            if result.get("details"):
+                print(result["details"])
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

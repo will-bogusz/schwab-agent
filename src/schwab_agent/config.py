@@ -1,7 +1,8 @@
 """
 Configuration Management
 ------------------------
-Single source for config paths and loading. Replaces paths.py.
+Single source for config paths and loading. Replaces duplicated load_config()
+across client.py and server.py.
 
 Search order for config directory:
   1. SCHWAB_AGENT_DIR environment variable
@@ -13,7 +14,10 @@ import json
 import os
 from pathlib import Path
 
-_REQUIRED_CONFIG_KEYS = {"client_id", "client_secret", "callback_url"}
+VALID_APPS = ("market", "trading")
+DEFAULT_APP = "market"
+
+_REQUIRED_CONFIG_KEYS = {"callback_url", "apps"}
 
 
 def find_config_dir() -> Path:
@@ -30,10 +34,11 @@ def find_config_dir() -> Path:
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         if (parent / "config.json").exists():
+            # Verify it looks like a schwab config (has "apps" key or "callback_url")
             try:
                 with open(parent / "config.json") as f:
                     data = json.load(f)
-                if "client_id" in data or "callback_url" in data:
+                if "apps" in data or "callback_url" in data:
                     return parent
             except (json.JSONDecodeError, OSError):
                 continue
@@ -53,9 +58,11 @@ def get_config_path() -> Path:
     return find_config_dir() / "config.json"
 
 
-def get_token_path() -> Path:
-    """Get the token file path."""
-    return find_config_dir() / "tokens.json"
+def get_token_path(app: str = DEFAULT_APP) -> Path:
+    """Get the token file path for a specific app."""
+    if app not in VALID_APPS:
+        raise ValueError(f"Invalid app '{app}'. Must be one of: {VALID_APPS}")
+    return find_config_dir() / f"tokens_{app}.json"
 
 
 def load_config() -> dict:
@@ -72,3 +79,21 @@ def load_config() -> dict:
         raise ValueError(f"Config missing required keys: {missing}")
 
     return config
+
+
+def get_app_config(app: str = DEFAULT_APP) -> dict:
+    """Get configuration for a specific app."""
+    if app not in VALID_APPS:
+        raise ValueError(f"Invalid app '{app}'. Must be one of: {VALID_APPS}")
+
+    config = load_config()
+    app_config = config.get("apps", {}).get(app)
+
+    if not app_config:
+        raise ValueError(f"App '{app}' not found in config")
+
+    return {
+        "client_id": app_config["client_id"],
+        "client_secret": app_config["client_secret"],
+        "callback_url": config["callback_url"],
+    }

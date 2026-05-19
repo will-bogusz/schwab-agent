@@ -1,14 +1,16 @@
+#!/usr/bin/env python3
 """
 Schwab CLI
 ----------
 Full-coverage CLI for the Schwab API via schwab-py.
 
 Usage:
-    uv run schwab <command> [options]
+    schwab <command> [options]
 
 Global flags:
     --raw               JSON output
     --account ID        Account identifier (index, number, or hash prefix)
+    --app <market|trading>  Override default app
 """
 
 import json
@@ -18,12 +20,20 @@ from datetime import datetime, timedelta
 
 from . import config
 from .client import get_client, get_account_hashes, resolve_account
+from .market import normalize_quote, normalized_quote_rows
+from .options_eval import evaluate_calls
 from .output import emit, emit_error, fmt_currency, fmt_percent, fmt_table
+from .technical import fetch_technical_snapshot
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _get_client(args):
+    """Get client using args.app or the command's default."""
+    return get_client(args.app or args._default_app)
+
 
 def _resolve_account(client, args):
     """Resolve account from args."""
@@ -36,12 +46,20 @@ def _resolve_account(client, args):
 
 def cmd_quote(args):
     """Get quotes for symbols."""
-    client = get_client()
+    client = _get_client(args)
 
     kwargs = {}
     if args.fields:
         fields = [client.Quote.Fields[f.upper()] for f in args.fields]
         kwargs["fields"] = fields
+    else:
+        kwargs["fields"] = [
+            client.Quote.Fields.QUOTE,
+            client.Quote.Fields.EXTENDED,
+            client.Quote.Fields.REGULAR,
+            client.Quote.Fields.REFERENCE,
+            client.Quote.Fields.FUNDAMENTAL,
+        ]
 
     if len(args.symbols) == 1:
         resp = client.get_quote(args.symbols[0], **kwargs)
@@ -54,37 +72,16 @@ def cmd_quote(args):
         emit(data, raw=True)
         return
 
-    for symbol, quote_data in data.items():
-        quote = quote_data.get("quote", quote_data)
-        ref = quote_data.get("reference", {})
-
-        print(f"\n{'=' * 50}")
-        print(f"  {symbol} - {ref.get('description', 'N/A')}")
-        print(f"{'=' * 50}")
-
-        last = quote.get("lastPrice", quote.get("mark"))
-        change = quote.get("netChange", 0)
-        change_pct = quote.get("netPercentChange", 0)
-
-        print(f"  Last:     {fmt_currency(last)}")
-        print(f"  Change:   {fmt_currency(change)} ({fmt_percent(change_pct)})")
-        print(f"  Bid/Ask:  {fmt_currency(quote.get('bidPrice'))} / {fmt_currency(quote.get('askPrice'))}")
-        print(f"  Volume:   {quote.get('totalVolume', 0):,}")
-        print(f"  High:     {fmt_currency(quote.get('highPrice'))}")
-        print(f"  Low:      {fmt_currency(quote.get('lowPrice'))}")
-
-        fundamental = quote_data.get("fundamental")
-        if fundamental:
-            print(f"\n  Fundamental:")
-            for key in ("peRatio", "divYield", "eps", "marketCap"):
-                val = fundamental.get(key)
-                if val is not None:
-                    print(f"    {key}: {val}")
+    normalized = {symbol: normalize_quote(symbol, quote_data) for symbol, quote_data in data.items()}
+    headers = ["Symbol", "Sess", "Price", "Day", "Bid/Ask", "Spr%", "Volume", "Age", "Source"]
+    print()
+    print(fmt_table(headers, normalized_quote_rows(normalized), "<<><<<><<"))
+    print("\n  Sess: REG regular, PM premarket, AH after-hours, STALE old quote. Use --raw for full Schwab payload.")
 
 
 def cmd_positions(args):
     """Show account positions."""
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
 
     resp = client.get_account(account_hash, fields=[client.Account.Fields.POSITIONS])
@@ -100,38 +97,56 @@ def cmd_positions(args):
         print("No positions found.")
         return
 
-    headers = ["Symbol", "Qty", "Avg Cost", "Mkt Value", "P/L", "P/L %"]
+    headers = ["Symbol", "Curr", "Qty", "Avg Cost", "Mkt Value", "Unrealized P/L", "Day P/L", "Day P/L %"]
     rows = []
-    total_value = total_pl = 0
+    total_value_usd = total_day_pl_usd = 0
+    mixed_currency = False
 
     for pos in positions:
-        symbol = pos.get("instrument", {}).get("symbol", "N/A")
+        inst = pos.get("instrument", {})
+        symbol = inst.get("symbol", "N/A")
+        currency = inst.get("currency", "USD")
         qty = pos.get("longQuantity", 0) - pos.get("shortQuantity", 0)
         avg_cost = pos.get("averagePrice", 0)
         mkt_value = pos.get("marketValue", 0)
-        pl = pos.get("currentDayProfitLoss", 0)
-        pl_pct = pos.get("currentDayProfitLossPercentage", 0)
+        unrealized = mkt_value - (avg_cost * qty) if avg_cost else 0
+        day_pl = pos.get("currentDayProfitLoss", 0)
+        day_pl_pct = pos.get("currentDayProfitLossPercentage", 0)
 
-        total_value += mkt_value
-        total_pl += pl
+        # Non-USD Schwab holdings are rare but worth flagging rather than silently summing.
+        if currency != "USD":
+            mixed_currency = True
+        else:
+            total_value_usd += mkt_value
+            total_day_pl_usd += day_pl
 
         rows.append([
             symbol,
+            currency,
             f"{qty:.2f}",
-            fmt_currency(avg_cost),
-            fmt_currency(mkt_value),
-            fmt_currency(pl),
-            fmt_percent(pl_pct),
+            fmt_currency(avg_cost, currency),
+            fmt_currency(mkt_value, currency),
+            fmt_currency(unrealized, currency),
+            fmt_currency(day_pl, currency),
+            fmt_percent(day_pl_pct),
         ])
 
-    rows.append(["TOTAL", "", "", fmt_currency(total_value), fmt_currency(total_pl), ""])
+    rows.append([
+        "TOTAL (USD only)", "", "", "",
+        fmt_currency(total_value_usd),
+        "",
+        fmt_currency(total_day_pl_usd),
+        "",
+    ])
     print()
-    print(fmt_table(headers, rows, "<>>>>>"))
+    print(fmt_table(headers, rows, "<<>>>>>>"))
+    if mixed_currency:
+        print("\n  Note: Non-USD positions shown but excluded from TOTAL. Add FX conversion if needed.")
 
 
 def cmd_balances(args):
     """Show account balances."""
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
 
     resp = client.get_account(account_hash)
@@ -157,7 +172,7 @@ def cmd_balances(args):
 
 def cmd_orders(args):
     """Show orders."""
-    client = get_client()
+    client = _get_client(args)
 
     days = args.days or 60
     end = datetime.now()
@@ -169,6 +184,7 @@ def cmd_orders(args):
         try:
             kwargs["status"] = client.Order.Status[args.status.upper()]
         except KeyError:
+            # Try friendly aliases
             aliases = {
                 "pending": "PENDING_ACTIVATION",
                 "working": "WORKING",
@@ -202,7 +218,7 @@ def cmd_orders(args):
     rows = []
 
     for order in orders:
-        order_id = str(order.get("orderId", "N/A"))[:10]
+        order_id = str(order.get("orderId", "N/A"))
         status = order.get("status", "N/A")
         order_type = order.get("orderType", "N/A")
 
@@ -227,7 +243,7 @@ def cmd_orders(args):
 
 def cmd_options(args):
     """Get option chain for a symbol."""
-    client = get_client()
+    client = _get_client(args)
 
     kwargs = {}
     if args.calls:
@@ -277,35 +293,153 @@ def cmd_options(args):
             print(f"    ... and {len(call_map) - 5} more")
 
 
+def cmd_technical(args):
+    """Show a Schwab intraday technical snapshot."""
+    client = _get_client(args)
+    data = fetch_technical_snapshot(client, args.symbol)
+
+    if args.raw:
+        emit(data, raw=True)
+        return
+
+    print(f"\n  Technical Snapshot: {args.symbol}")
+    print("=" * 44)
+    print(f"  Last:        {fmt_currency(data.get('last'))}")
+    print(f"  Day range:   {fmt_currency(data.get('day_low'))} - {fmt_currency(data.get('day_high'))}")
+    print(f"  Ext range:   {fmt_currency(data.get('extended_low'))} - {fmt_currency(data.get('extended_high'))}")
+    print(f"  VWAP:        {fmt_currency(data.get('vwap'))}")
+    print(f"  Volume:      {data.get('volume', 0):,}")
+    print("\n  Moving averages")
+    headers = ["Window", "SMA", "EMA", "Last vs SMA", "Last vs EMA"]
+    rows = []
+    last = data.get("last")
+    for window in (5, 10, 20, 50, 200):
+        sma = data.get(f"sma_{window}d")
+        ema = data.get(f"ema_{window}d")
+        rows.append([
+            f"{window}d",
+            fmt_currency(sma),
+            fmt_currency(ema),
+            fmt_percent((last - sma) / sma * 100) if last and sma else "N/A",
+            fmt_percent((last - ema) / ema * 100) if last and ema else "N/A",
+        ])
+    print(fmt_table(headers, rows, "<>>>>"))
+
+
+def _scenario_summary(record: dict, labels: list[str]) -> str:
+    parts = []
+    for label in labels:
+        scenario = record.get("scenarios", {}).get(label)
+        if not scenario:
+            continue
+        ret = scenario.get("return_pct")
+        parts.append(f"{label}:{fmt_percent(ret)}")
+    return " ".join(parts) if parts else "N/A"
+
+
+def cmd_options_eval(args):
+    """Evaluate outright call and call-spread scenarios."""
+    client = _get_client(args)
+    kwargs = {
+        "contract_type": client.Options.ContractType.CALL,
+        "strike_count": args.strikes,
+        "include_underlying_quote": True,
+    }
+    if args.from_date:
+        kwargs["from_date"] = datetime.strptime(args.from_date, "%Y-%m-%d")
+    if args.to_date:
+        kwargs["to_date"] = datetime.strptime(args.to_date, "%Y-%m-%d")
+
+    resp = client.get_option_chain(args.symbol, **kwargs)
+    resp.raise_for_status()
+    chain = resp.json()
+    targets = [float(v) for v in args.target_pct.split(",")]
+    data = evaluate_calls(
+        chain,
+        targets,
+        max_expiries=args.expiries,
+        min_dte=args.min_dte,
+        max_dte=args.max_dte,
+    )
+
+    if args.raw:
+        emit(data, raw=True)
+        return
+
+    labels = [f"+{v:g}%" for v in targets]
+    print(f"\n  Options Eval: {args.symbol}  Underlying {fmt_currency(data.get('underlying_price'))}")
+    print("=" * 80)
+
+    if not data["outright_calls"] and not data["call_spreads"]:
+        print("  No evaluable call contracts found for the requested DTE/strike filters.")
+        print("  Try widening --min-dte/--max-dte or --strikes, or use --raw to inspect the Schwab chain.")
+        return
+
+    print("\n  Outright calls")
+    headers = ["Exp", "DTE", "Strike", "Debit", "BE", "Delta", "OI", "Spr%", "Scenarios"]
+    rows = []
+    for row in data["outright_calls"][: args.limit]:
+        rows.append([
+            row["expiry"],
+            row.get("dte"),
+            fmt_currency(row.get("strike")),
+            fmt_currency(row.get("debit")),
+            fmt_currency(row.get("breakeven")),
+            f"{row.get('delta'):.2f}" if row.get("delta") is not None else "N/A",
+            row.get("open_interest") or 0,
+            fmt_percent(row.get("spread_pct")),
+            _scenario_summary(row, labels),
+        ])
+    print(fmt_table(headers, rows, "<<>>>>><<"))
+
+    print("\n  Call spreads")
+    headers = ["Exp", "DTE", "Long/Short", "Debit", "MaxRet", "BE", "Scenarios"]
+    rows = []
+    for row in data["call_spreads"][: args.limit]:
+        rows.append([
+            row["expiry"],
+            row.get("dte"),
+            f"{row.get('long_strike'):g}/{row.get('short_strike'):g}",
+            fmt_currency(row.get("debit")),
+            fmt_percent(row.get("max_return_pct")),
+            fmt_currency(row.get("breakeven")),
+            _scenario_summary(row, labels),
+        ])
+    print(fmt_table(headers, rows, "<<>>>> <".replace(" ", "")))
+
+
 def cmd_auth(args):
-    """Check authentication status."""
+    """Check authentication status for all apps."""
     print("\n  Authentication Status")
     print("=" * 40)
 
-    token_path = config.get_token_path()
-    if not token_path.exists():
-        print("  Tokens: MISSING — run schwab-auth to authenticate")
-        return
+    for app_name in config.VALID_APPS:
+        token_path = config.get_token_path(app_name)
 
-    try:
-        client = get_client()
+        if not token_path.exists():
+            print(f"  {app_name}: No tokens")
+            continue
 
-        resp = client.get_account_numbers()
-        resp.raise_for_status()
-        accounts = resp.json()
-        print(f"  Account access: OK ({len(accounts)} account(s))")
+        try:
+            client = get_client(app_name)
 
-        resp = client.get_quote("AAPL")
-        resp.raise_for_status()
-        print(f"  Market data: OK")
+            if app_name == "trading":
+                resp = client.get_account_numbers()
+                resp.raise_for_status()
+                accounts = resp.json()
+                print(f"  {app_name}: OK ({len(accounts)} account(s))")
+            else:
+                resp = client.get_quote("AAPL")
+                resp.raise_for_status()
+                print(f"  {app_name}: OK")
 
-    except Exception as e:
-        print(f"  Error: {e}")
+        except Exception as e:
+            print(f"  {app_name}: Error - {e}")
 
 
 def cmd_accounts(args):
     """List all linked accounts."""
-    client = get_client()
+    client = _get_client(args)
     accounts = get_account_hashes(client)
 
     if args.raw:
@@ -322,7 +456,7 @@ def cmd_order(args):
     """Place an order via OrderBuilder."""
     from .orders import build_order, build_option_symbol, safety_check, format_order_preview
 
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
 
     # Build option symbol if option flags provided
@@ -379,11 +513,15 @@ def cmd_preview(args):
     """Server-side order preview."""
     from .orders import safety_check, format_order_preview
 
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
 
-    order_dict = json.loads(args.data)
+    if args.data:
+        order_dict = json.loads(args.data)
+    else:
+        emit_error("--data is required for preview")
 
+    # Safety check
     warnings = safety_check(order_dict, client)
 
     print(format_order_preview(order_dict))
@@ -392,19 +530,18 @@ def cmd_preview(args):
         for w in warnings:
             print(f"    - {w}")
 
+    # Server-side preview
     resp = client.preview_order(account_hash, order_dict)
     resp.raise_for_status()
 
-    if args.raw:
-        emit(resp.json(), raw=True)
-    else:
+    if not args.raw:
         print("\n  Server Preview Response:")
-        emit(resp.json(), raw=True)
+    emit(resp.json(), raw=True)
 
 
 def cmd_cancel(args):
     """Cancel an order."""
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
 
     if not args.confirm:
@@ -424,8 +561,11 @@ def cmd_replace(args):
     """Replace (modify) an existing order."""
     from .orders import safety_check, format_order_preview
 
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
+
+    if not args.data:
+        emit_error("--data is required for replace")
 
     order_dict = json.loads(args.data)
 
@@ -453,7 +593,7 @@ def cmd_replace(args):
 
 def cmd_expirations(args):
     """Get option expiration chain."""
-    client = get_client()
+    client = _get_client(args)
 
     resp = client.get_option_expiration_chain(args.symbol)
     resp.raise_for_status()
@@ -479,17 +619,26 @@ def cmd_expirations(args):
 
 def cmd_history(args):
     """Get price history for a symbol."""
-    client = get_client()
+    client = _get_client(args)
 
     kwargs = {}
 
     # Shortcuts
     if args.daily:
+        kwargs["period_type"] = client.PriceHistory.PeriodType.YEAR
+        kwargs["period"] = client.PriceHistory.Period.ONE_YEAR
         kwargs["frequency_type"] = client.PriceHistory.FrequencyType.DAILY
+        kwargs["frequency"] = client.PriceHistory.Frequency.DAILY
     elif args.weekly:
+        kwargs["period_type"] = client.PriceHistory.PeriodType.YEAR
+        kwargs["period"] = client.PriceHistory.Period.ONE_YEAR
         kwargs["frequency_type"] = client.PriceHistory.FrequencyType.WEEKLY
+        kwargs["frequency"] = client.PriceHistory.Frequency.WEEKLY
     elif args.minute:
+        kwargs["period_type"] = client.PriceHistory.PeriodType.DAY
+        kwargs["period"] = client.PriceHistory.Period.ONE_DAY
         kwargs["frequency_type"] = client.PriceHistory.FrequencyType.MINUTE
+        kwargs["frequency"] = client.PriceHistory.Frequency.EVERY_MINUTE
 
     if args.period_type:
         kwargs["period_type"] = client.PriceHistory.PeriodType[args.period_type.upper()]
@@ -524,7 +673,7 @@ def cmd_history(args):
 
     headers = ["Date", "Open", "High", "Low", "Close", "Volume"]
     rows = []
-    for c in candles[-20:]:
+    for c in candles[-20:]:  # Last 20 bars
         dt = datetime.fromtimestamp(c["datetime"] / 1000).strftime("%Y-%m-%d %H:%M")
         rows.append([
             dt,
@@ -542,7 +691,7 @@ def cmd_history(args):
 
 def cmd_transactions(args):
     """Get account transactions."""
-    client = get_client()
+    client = _get_client(args)
     account_hash = _resolve_account(client, args)
 
     kwargs = {}
@@ -584,7 +733,7 @@ def cmd_transactions(args):
 
 def cmd_movers(args):
     """Get market movers."""
-    client = get_client()
+    client = _get_client(args)
 
     index = client.Movers.Index[args.index.upper().replace("$", "")]
     kwargs = {}
@@ -623,7 +772,7 @@ def cmd_movers(args):
 
 def cmd_hours(args):
     """Get market hours."""
-    client = get_client()
+    client = _get_client(args)
 
     markets = [client.MarketHours.Market[m.upper()] for m in (args.market or ["EQUITY"])]
 
@@ -651,7 +800,7 @@ def cmd_hours(args):
 
 def cmd_search(args):
     """Search for instruments."""
-    client = get_client()
+    client = _get_client(args)
 
     projection = client.Instrument.Projection[args.projection.upper().replace("-", "_")]
     resp = client.get_instruments(args.query, projection)
@@ -683,7 +832,7 @@ def cmd_search(args):
 
 def cmd_instrument(args):
     """Get instrument by CUSIP."""
-    client = get_client()
+    client = _get_client(args)
 
     resp = client.get_instrument_by_cusip(args.cusip)
     resp.raise_for_status()
@@ -721,6 +870,7 @@ def main():
         description="Schwab CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--app", choices=config.VALID_APPS, help="Override default app")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # --- quote ---
@@ -728,19 +878,19 @@ def main():
     p.add_argument("symbols", nargs="+", help="Stock symbols")
     p.add_argument("--fields", nargs="+", help="Quote fields (quote, fundamental, extended, reference, regular)")
     _add_raw(p)
-    p.set_defaults(func=cmd_quote)
+    p.set_defaults(func=cmd_quote, _default_app="market")
 
     # --- positions ---
     p = subparsers.add_parser("positions", help="Show account positions")
     _add_raw(p)
     _add_account(p)
-    p.set_defaults(func=cmd_positions)
+    p.set_defaults(func=cmd_positions, _default_app="trading")
 
     # --- balances ---
     p = subparsers.add_parser("balances", help="Show account balances")
     _add_raw(p)
     _add_account(p)
-    p.set_defaults(func=cmd_balances)
+    p.set_defaults(func=cmd_balances, _default_app="trading")
 
     # --- orders ---
     p = subparsers.add_parser("orders", help="Show orders")
@@ -750,7 +900,7 @@ def main():
     p.add_argument("--days", type=int, help="Look back N days (default: 60)")
     _add_raw(p)
     _add_account(p)
-    p.set_defaults(func=cmd_orders)
+    p.set_defaults(func=cmd_orders, _default_app="trading")
 
     # --- options ---
     p = subparsers.add_parser("options", help="Get option chain")
@@ -764,16 +914,36 @@ def main():
     p.add_argument("--range", help="Strike range (in-the-money, near-the-money, out-of-the-money, etc.)")
     p.add_argument("--include-quote", action="store_true", help="Include underlying quote data")
     _add_raw(p)
-    p.set_defaults(func=cmd_options)
+    p.set_defaults(func=cmd_options, _default_app="market")
+
+    # --- technical ---
+    p = subparsers.add_parser("technical", help="Intraday technical snapshot from Schwab history")
+    p.add_argument("symbol", help="Symbol")
+    _add_raw(p)
+    p.set_defaults(func=cmd_technical, _default_app="market")
+
+    # --- options-eval ---
+    p = subparsers.add_parser("options-eval", help="Evaluate calls and call spreads over target moves")
+    p.add_argument("symbol", help="Underlying symbol")
+    p.add_argument("--target-pct", default="30,50,70", help="Comma-separated target moves, e.g. 30,50,70")
+    p.add_argument("--strikes", type=int, default=20, help="Number of strikes around ATM")
+    p.add_argument("--expiries", type=int, default=6, help="Max expiries to evaluate")
+    p.add_argument("--min-dte", type=int, default=30, help="Minimum days to expiry")
+    p.add_argument("--max-dte", type=int, default=420, help="Maximum days to expiry")
+    p.add_argument("--limit", type=int, default=12, help="Rows per section")
+    p.add_argument("--from-date", help="First expiration date YYYY-MM-DD")
+    p.add_argument("--to-date", help="Last expiration date YYYY-MM-DD")
+    _add_raw(p)
+    p.set_defaults(func=cmd_options_eval, _default_app="market")
 
     # --- auth ---
     p = subparsers.add_parser("auth", help="Check authentication status")
-    p.set_defaults(func=cmd_auth)
+    p.set_defaults(func=cmd_auth, _default_app="trading")
 
     # --- accounts ---
     p = subparsers.add_parser("accounts", help="List linked accounts")
     _add_raw(p)
-    p.set_defaults(func=cmd_accounts)
+    p.set_defaults(func=cmd_accounts, _default_app="trading")
 
     # --- order ---
     p = subparsers.add_parser("order", help="Place an order")
@@ -785,31 +955,33 @@ def main():
     p.add_argument("--stop-price", help="Stop trigger price")
     p.add_argument("--duration", help="Duration (DAY, GOOD_TILL_CANCEL, etc.)")
     p.add_argument("--session", help="Session (NORMAL, AM, PM, SEAMLESS)")
+    # Option-specific
     p.add_argument("--underlying", help="Option: underlying symbol")
     p.add_argument("--expiry", help="Option: expiration (YYYYMMDD or YYYY-MM-DD)")
     p.add_argument("--strike", help="Option: strike price")
     p.add_argument("--right", help="Option: C/P or CALL/PUT")
+    # Trailing stop
     p.add_argument("--stop-offset", help="Trailing stop offset")
     p.add_argument("--stop-link-basis", help="Trailing stop link basis (LAST, BID, ASK, etc.)")
     p.add_argument("--stop-link-type", help="Trailing stop link type (VALUE, PERCENT)")
     _add_raw(p)
     _add_account(p)
     _add_confirm(p)
-    p.set_defaults(func=cmd_order)
+    p.set_defaults(func=cmd_order, _default_app="trading")
 
     # --- preview ---
     p = subparsers.add_parser("preview", help="Server-side order preview")
     p.add_argument("--data", "-d", required=True, help="Order JSON")
     _add_raw(p)
     _add_account(p)
-    p.set_defaults(func=cmd_preview)
+    p.set_defaults(func=cmd_preview, _default_app="trading")
 
     # --- cancel ---
     p = subparsers.add_parser("cancel", help="Cancel an order")
     p.add_argument("--order-id", required=True, help="Order ID to cancel")
     _add_account(p)
     _add_confirm(p)
-    p.set_defaults(func=cmd_cancel)
+    p.set_defaults(func=cmd_cancel, _default_app="trading")
 
     # --- replace ---
     p = subparsers.add_parser("replace", help="Replace (modify) an order")
@@ -818,13 +990,13 @@ def main():
     _add_raw(p)
     _add_account(p)
     _add_confirm(p)
-    p.set_defaults(func=cmd_replace)
+    p.set_defaults(func=cmd_replace, _default_app="trading")
 
     # --- expirations ---
     p = subparsers.add_parser("expirations", help="Get option expiration chain")
     p.add_argument("symbol", help="Underlying symbol")
     _add_raw(p)
-    p.set_defaults(func=cmd_expirations)
+    p.set_defaults(func=cmd_expirations, _default_app="market")
 
     # --- history ---
     p = subparsers.add_parser("history", help="Get price history")
@@ -840,7 +1012,7 @@ def main():
     p.add_argument("--weekly", action="store_true", help="Shortcut: weekly bars")
     p.add_argument("--minute", action="store_true", help="Shortcut: minute bars")
     _add_raw(p)
-    p.set_defaults(func=cmd_history)
+    p.set_defaults(func=cmd_history, _default_app="market")
 
     # --- transactions ---
     p = subparsers.add_parser("transactions", help="Get account transactions")
@@ -850,7 +1022,7 @@ def main():
     p.add_argument("--to", help="End date (YYYY-MM-DD)")
     _add_raw(p)
     _add_account(p)
-    p.set_defaults(func=cmd_transactions)
+    p.set_defaults(func=cmd_transactions, _default_app="trading")
 
     # --- movers ---
     p = subparsers.add_parser("movers", help="Get market movers")
@@ -858,14 +1030,14 @@ def main():
     p.add_argument("--sort", help="Sort order (volume, trades, percent_change_up, percent_change_down)")
     p.add_argument("--frequency", help="Frequency (zero, one, five, ten, thirty, sixty)")
     _add_raw(p)
-    p.set_defaults(func=cmd_movers)
+    p.set_defaults(func=cmd_movers, _default_app="market")
 
     # --- hours ---
     p = subparsers.add_parser("hours", help="Get market hours")
     p.add_argument("--market", nargs="+", help="Market types (equity, option, bond, future, forex)")
     p.add_argument("--date", help="Date (YYYY-MM-DD)")
     _add_raw(p)
-    p.set_defaults(func=cmd_hours)
+    p.set_defaults(func=cmd_hours, _default_app="market")
 
     # --- search ---
     p = subparsers.add_parser("search", help="Search for instruments")
@@ -873,13 +1045,13 @@ def main():
     p.add_argument("--projection", default="symbol-search",
                    help="Projection (symbol-search, symbol-regex, description-search, description-regex, search, fundamental)")
     _add_raw(p)
-    p.set_defaults(func=cmd_search)
+    p.set_defaults(func=cmd_search, _default_app="market")
 
     # --- instrument ---
     p = subparsers.add_parser("instrument", help="Get instrument by CUSIP")
     p.add_argument("cusip", help="CUSIP identifier")
     _add_raw(p)
-    p.set_defaults(func=cmd_instrument)
+    p.set_defaults(func=cmd_instrument, _default_app="market")
 
     # --- Parse and dispatch ---
     args = parser.parse_args()

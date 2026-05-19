@@ -22,11 +22,15 @@ def emit_error(message: str, code: int = 1):
     sys.exit(code)
 
 
-def fmt_currency(value) -> str:
-    """Format a value as currency."""
+CURRENCY_PREFIX = {"CAD": "C$", "EUR": "€", "USD": "$", "HKD": "HK$", "GBP": "£"}
+
+
+def fmt_currency(value, currency: str = "USD") -> str:
+    """Format a value as currency. Pass the asset currency to get the right symbol."""
     if value is None:
         return "N/A"
-    return f"${value:,.2f}"
+    prefix = CURRENCY_PREFIX.get(currency, "$")
+    return f"{prefix}{value:,.2f}"
 
 
 def fmt_percent(value) -> str:
@@ -63,6 +67,7 @@ def fmt_table(headers: list[str], rows: list[list], alignments: str | None = Non
             if i < ncols:
                 widths[i] = max(widths[i], len(val))
 
+    # Build format string
     def fmt_cell(val: str, width: int, align: str) -> str:
         if align == ">":
             return val.rjust(width)
@@ -75,10 +80,13 @@ def fmt_table(headers: list[str], rows: list[list], alignments: str | None = Non
         fmt_cell(h, widths[i], alignments[i]) for i, h in enumerate(headers)
     )
     lines.append(header_line)
+
+    # Separator
     lines.append("-" * len(header_line))
 
     # Data rows
     for row in str_rows:
+        # Pad row if needed
         padded = row + [""] * (ncols - len(row))
         line = "  ".join(
             fmt_cell(padded[i], widths[i], alignments[i]) for i in range(ncols)
