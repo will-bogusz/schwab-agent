@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Schwab OAuth tokens twice daily
+
+[Timer]
+OnBootSec=5m
+OnCalendar=*-*-* 00,12:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -158,11 +158,11 @@ def build_order(
     builder.set_order_strategy_type(OrderStrategyType.SINGLE)
 
     if price is not None:
-        builder.set_price(str(price))
+        builder.set_price(price)
     if stop_price is not None:
-        builder.set_stop_price(str(stop_price))
+        builder.set_stop_price(stop_price)
     if stop_price_offset is not None:
-        builder.set_stop_price_offset(str(stop_price_offset))
+        builder.set_stop_price_offset(stop_price_offset)
     if stop_price_link_basis is not None:
         builder.set_stop_price_link_basis(StopPriceLinkBasis[stop_price_link_basis.upper()])
     if stop_price_link_type is not None:
@@ -274,8 +274,13 @@ def safety_check(order_dict: dict, client=None) -> list[str]:
                                 f"Limit ${limit:.2f} is {deviation:.1f}% from "
                                 f"current ${current:.2f}"
                             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # The price-deviation check is a safety rail — a silent no-op lets a
+            # limit order far from market pass unwarned. Surface the failure.
+            warnings.append(
+                f"WARNING: Price deviation check skipped ({type(exc).__name__}: {exc}). "
+                f"Verify limit price manually."
+            )
 
     return warnings
 

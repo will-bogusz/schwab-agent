@@ -13,6 +13,7 @@ Then visit:
 """
 
 import json
+import sys
 import time
 import base64
 import argparse
@@ -49,13 +50,24 @@ def load_tokens_raw(app_name: str) -> dict | None:
         return json.load(f)
 
 
-def save_tokens(app_name: str, tokens: dict):
-    """Save tokens in schwab-py compatible format with creation_timestamp."""
-    tokens["creation_timestamp"] = int(time.time())
+def wrap_tokens(tokens: dict, creation_timestamp: int | None = None) -> dict:
+    """Wrap raw OAuth tokens in the metadata format expected by schwab-py."""
+    if "token" in tokens:
+        return tokens
+
+    token = {k: v for k, v in tokens.items() if k != "creation_timestamp"}
+    return {
+        "creation_timestamp": creation_timestamp or tokens.get("creation_timestamp") or int(time.time()),
+        "token": token,
+    }
+
+
+def save_tokens(app_name: str, tokens: dict, creation_timestamp: int | None = None):
+    """Save tokens in schwab-py's metadata-wrapped format."""
     path = config.get_token_path(app_name)
     with open(path, "w") as f:
-        json.dump(tokens, f, indent=2)
-    print(f"  Tokens saved to {path}")
+        json.dump(wrap_tokens(tokens, creation_timestamp=creation_timestamp), f, indent=2)
+    print(f"  Tokens saved to {path}", file=sys.stderr)
 
 
 def get_basic_auth(client_id: str, client_secret: str) -> str:
@@ -196,7 +208,15 @@ def callback():
     if not code:
         return jsonify({"error": "Missing authorization code"}), 400
 
-    app_name = state if state in config.VALID_APPS else "market"
+    # Require a valid state — silent fallback to "market" could let a trading-app
+    # auth code overwrite market tokens if state is tampered or absent.
+    if not state or state not in config.VALID_APPS:
+        return jsonify({
+            "error": "Invalid or missing OAuth state parameter",
+            "expected": list(config.VALID_APPS),
+            "got": state,
+        }), 400
+    app_name = state
     print(f"\n  Received callback for '{app_name}'")
 
     app_config = config.get_app_config(app_name)
@@ -245,12 +265,19 @@ def callback():
 @app.route("/refresh/<app_name>")
 def refresh(app_name: str):
     """Refresh tokens for an app."""
+    result = refresh_tokens(app_name)
+    status_code = 200 if result.get("status") == "success" else 400
+    return jsonify(result), status_code
+
+
+def refresh_tokens(app_name: str) -> dict:
+    """Refresh tokens for an app without requiring the Flask request path."""
     if app_name not in config.VALID_APPS:
-        return jsonify({"error": f"Invalid app. Must be one of: {config.VALID_APPS}"}), 400
+        return {"status": "error", "app": app_name, "error": f"Invalid app. Must be one of: {config.VALID_APPS}"}
 
     tokens = load_tokens(app_name)
     if not tokens or not tokens.get("refresh_token"):
-        return jsonify({"error": "No refresh token. Please authenticate first."}), 400
+        return {"status": "error", "app": app_name, "error": "No refresh token. Please authenticate first."}
 
     app_config = config.get_app_config(app_name)
 
@@ -267,10 +294,19 @@ def refresh(app_name: str):
 
     if resp.status_code == 200:
         new_tokens = resp.json()
-        save_tokens(app_name, new_tokens)
-        return jsonify({"status": "success", "app": app_name, "expires_in": new_tokens.get("expires_in")})
-    else:
-        return jsonify({"error": "Refresh failed", "details": resp.text}), 500
+        # Schwab returns a fresh refresh token on refresh. Reset the timestamp so
+        # local status tracks the new 7-day refresh window, not the original
+        # browser-auth time. If Schwab ever omits refresh_token, keep the prior
+        # token but do not pretend the refresh window was extended.
+        if new_tokens.get("refresh_token"):
+            creation_timestamp = int(time.time())
+        else:
+            raw = load_tokens_raw(app_name) or {}
+            new_tokens["refresh_token"] = tokens["refresh_token"]
+            creation_timestamp = raw.get("creation_timestamp")
+        save_tokens(app_name, new_tokens, creation_timestamp=creation_timestamp)
+        return {"status": "success", "app": app_name, "expires_in": new_tokens.get("expires_in")}
+    return {"status": "error", "app": app_name, "error": "Refresh failed", "details": resp.text}
 
 
 @app.route("/status")
@@ -311,7 +347,34 @@ def main():
     print(f"\nServer: http://localhost:{args.port}")
     print("=" * 50)
 
-    app.run(host="0.0.0.0", port=args.port, debug=False)
+    # Bind to localhost only — expose via SSH tunnel (see CLAUDE.md OAuth Flow).
+    # 0.0.0.0 would put /refresh/<app> on every network interface during auth.
+    app.run(host="127.0.0.1", port=args.port, debug=False)
+
+
+def refresh_main():
+    """CLI entry point for cron/systemd/launchd token keepalive."""
+    parser = argparse.ArgumentParser(description="Refresh Schwab OAuth tokens")
+    parser.add_argument(
+        "--app",
+        choices=[*config.VALID_APPS, "all"],
+        default="all",
+        help="App to refresh (default: all)",
+    )
+    args = parser.parse_args()
+
+    apps = list(config.VALID_APPS) if args.app == "all" else [args.app]
+    ok = True
+    for app_name in apps:
+        result = refresh_tokens(app_name)
+        if result.get("status") == "success":
+            print(f"{app_name}: refreshed ({result.get('expires_in')}s access token)")
+        else:
+            ok = False
+            print(f"{app_name}: refresh failed - {result.get('error')}")
+            if result.get("details"):
+                print(result["details"])
+    raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":

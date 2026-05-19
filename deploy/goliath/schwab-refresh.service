@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh Schwab OAuth tokens
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tmp/schwab
+Environment=SCHWAB_AGENT_DIR=%h/tmp/schwab
+ExecStart=%h/.local/bin/uv run schwab-auth-keepalive --app all --browser-fallback --headless

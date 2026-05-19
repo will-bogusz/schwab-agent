@@ -1,0 +1,15 @@
+[Unit]
+Description=Read-only Schwab streaming quote/account cache
+After=network-online.target schwab-oauth.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tmp/schwab
+Environment=SCHWAB_AGENT_DIR=%h/tmp/schwab
+Environment=SCHWAB_LIVE_CACHE_DIR=%h/tmp/trading/artifacts/schwab/live
+ExecStart=%h/.local/bin/uv run schwab-stream-cache --watchlist deploy/goliath/watchlist-us.txt --account-activity
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

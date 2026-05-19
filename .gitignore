@@ -1,6 +1,10 @@
 # Credentials and tokens - NEVER commit these
 config.json
 tokens*.json
+secrets/
+.auth/
+playwright-profile/
+schwab-login.env
 
 # Python-generated files
 __pycache__/

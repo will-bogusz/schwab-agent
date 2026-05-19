@@ -20,7 +20,10 @@ from datetime import datetime, timedelta
 
 from . import config
 from .client import get_client, get_account_hashes, resolve_account
+from .market import normalize_quote, normalized_quote_rows
+from .options_eval import evaluate_calls
 from .output import emit, emit_error, fmt_currency, fmt_percent, fmt_table
+from .technical import fetch_technical_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,14 @@ def cmd_quote(args):
     if args.fields:
         fields = [client.Quote.Fields[f.upper()] for f in args.fields]
         kwargs["fields"] = fields
+    else:
+        kwargs["fields"] = [
+            client.Quote.Fields.QUOTE,
+            client.Quote.Fields.EXTENDED,
+            client.Quote.Fields.REGULAR,
+            client.Quote.Fields.REFERENCE,
+            client.Quote.Fields.FUNDAMENTAL,
+        ]
 
     if len(args.symbols) == 1:
         resp = client.get_quote(args.symbols[0], **kwargs)
@@ -61,33 +72,11 @@ def cmd_quote(args):
         emit(data, raw=True)
         return
 
-    for symbol, quote_data in data.items():
-        quote = quote_data.get("quote", quote_data)
-        ref = quote_data.get("reference", {})
-
-        print(f"\n{'=' * 50}")
-        print(f"  {symbol} - {ref.get('description', 'N/A')}")
-        print(f"{'=' * 50}")
-
-        last = quote.get("lastPrice", quote.get("mark"))
-        change = quote.get("netChange", 0)
-        change_pct = quote.get("netPercentChange", 0)
-
-        print(f"  Last:     {fmt_currency(last)}")
-        print(f"  Change:   {fmt_currency(change)} ({fmt_percent(change_pct)})")
-        print(f"  Bid/Ask:  {fmt_currency(quote.get('bidPrice'))} / {fmt_currency(quote.get('askPrice'))}")
-        print(f"  Volume:   {quote.get('totalVolume', 0):,}")
-        print(f"  High:     {fmt_currency(quote.get('highPrice'))}")
-        print(f"  Low:      {fmt_currency(quote.get('lowPrice'))}")
-
-        # Show fundamental data if requested
-        fundamental = quote_data.get("fundamental")
-        if fundamental:
-            print(f"\n  Fundamental:")
-            for key in ("peRatio", "divYield", "eps", "marketCap"):
-                val = fundamental.get(key)
-                if val is not None:
-                    print(f"    {key}: {val}")
+    normalized = {symbol: normalize_quote(symbol, quote_data) for symbol, quote_data in data.items()}
+    headers = ["Symbol", "Sess", "Price", "Day", "Bid/Ask", "Spr%", "Volume", "Age", "Source"]
+    print()
+    print(fmt_table(headers, normalized_quote_rows(normalized), "<<><<<><<"))
+    print("\n  Sess: REG regular, PM premarket, AH after-hours, STALE old quote. Use --raw for full Schwab payload.")
 
 
 def cmd_positions(args):
@@ -108,35 +97,51 @@ def cmd_positions(args):
         print("No positions found.")
         return
 
-    headers = ["Symbol", "Qty", "Avg Cost", "Mkt Value", "P/L", "P/L %"]
+    headers = ["Symbol", "Curr", "Qty", "Avg Cost", "Mkt Value", "Unrealized P/L", "Day P/L", "Day P/L %"]
     rows = []
-    total_value = total_pl = 0
+    total_value_usd = total_day_pl_usd = 0
+    mixed_currency = False
 
     for pos in positions:
-        symbol = pos.get("instrument", {}).get("symbol", "N/A")
+        inst = pos.get("instrument", {})
+        symbol = inst.get("symbol", "N/A")
+        currency = inst.get("currency", "USD")
         qty = pos.get("longQuantity", 0) - pos.get("shortQuantity", 0)
         avg_cost = pos.get("averagePrice", 0)
         mkt_value = pos.get("marketValue", 0)
-        pl = pos.get("currentDayProfitLoss", 0)
-        pl_pct = pos.get("currentDayProfitLossPercentage", 0)
+        unrealized = mkt_value - (avg_cost * qty) if avg_cost else 0
+        day_pl = pos.get("currentDayProfitLoss", 0)
+        day_pl_pct = pos.get("currentDayProfitLossPercentage", 0)
 
-        total_value += mkt_value
-        total_pl += pl
+        # Non-USD Schwab holdings are rare but worth flagging rather than silently summing.
+        if currency != "USD":
+            mixed_currency = True
+        else:
+            total_value_usd += mkt_value
+            total_day_pl_usd += day_pl
 
         rows.append([
             symbol,
+            currency,
             f"{qty:.2f}",
-            fmt_currency(avg_cost),
-            fmt_currency(mkt_value),
-            fmt_currency(pl),
-            fmt_percent(pl_pct),
+            fmt_currency(avg_cost, currency),
+            fmt_currency(mkt_value, currency),
+            fmt_currency(unrealized, currency),
+            fmt_currency(day_pl, currency),
+            fmt_percent(day_pl_pct),
         ])
 
     rows.append([
-        "TOTAL", "", "", fmt_currency(total_value), fmt_currency(total_pl), ""
+        "TOTAL (USD only)", "", "", "",
+        fmt_currency(total_value_usd),
+        "",
+        fmt_currency(total_day_pl_usd),
+        "",
     ])
     print()
-    print(fmt_table(headers, rows, "<>>>>>"))
+    print(fmt_table(headers, rows, "<<>>>>>>"))
+    if mixed_currency:
+        print("\n  Note: Non-USD positions shown but excluded from TOTAL. Add FX conversion if needed.")
 
 
 def cmd_balances(args):
@@ -213,7 +218,7 @@ def cmd_orders(args):
     rows = []
 
     for order in orders:
-        order_id = str(order.get("orderId", "N/A"))[:10]
+        order_id = str(order.get("orderId", "N/A"))
         status = order.get("status", "N/A")
         order_type = order.get("orderType", "N/A")
 
@@ -286,6 +291,121 @@ def cmd_options(args):
             print(f"    {exp}")
         if len(call_map) > 5:
             print(f"    ... and {len(call_map) - 5} more")
+
+
+def cmd_technical(args):
+    """Show a Schwab intraday technical snapshot."""
+    client = _get_client(args)
+    data = fetch_technical_snapshot(client, args.symbol)
+
+    if args.raw:
+        emit(data, raw=True)
+        return
+
+    print(f"\n  Technical Snapshot: {args.symbol}")
+    print("=" * 44)
+    print(f"  Last:        {fmt_currency(data.get('last'))}")
+    print(f"  Day range:   {fmt_currency(data.get('day_low'))} - {fmt_currency(data.get('day_high'))}")
+    print(f"  Ext range:   {fmt_currency(data.get('extended_low'))} - {fmt_currency(data.get('extended_high'))}")
+    print(f"  VWAP:        {fmt_currency(data.get('vwap'))}")
+    print(f"  Volume:      {data.get('volume', 0):,}")
+    print("\n  Moving averages")
+    headers = ["Window", "SMA", "EMA", "Last vs SMA", "Last vs EMA"]
+    rows = []
+    last = data.get("last")
+    for window in (5, 10, 20, 50, 200):
+        sma = data.get(f"sma_{window}d")
+        ema = data.get(f"ema_{window}d")
+        rows.append([
+            f"{window}d",
+            fmt_currency(sma),
+            fmt_currency(ema),
+            fmt_percent((last - sma) / sma * 100) if last and sma else "N/A",
+            fmt_percent((last - ema) / ema * 100) if last and ema else "N/A",
+        ])
+    print(fmt_table(headers, rows, "<>>>>"))
+
+
+def _scenario_summary(record: dict, labels: list[str]) -> str:
+    parts = []
+    for label in labels:
+        scenario = record.get("scenarios", {}).get(label)
+        if not scenario:
+            continue
+        ret = scenario.get("return_pct")
+        parts.append(f"{label}:{fmt_percent(ret)}")
+    return " ".join(parts) if parts else "N/A"
+
+
+def cmd_options_eval(args):
+    """Evaluate outright call and call-spread scenarios."""
+    client = _get_client(args)
+    kwargs = {
+        "contract_type": client.Options.ContractType.CALL,
+        "strike_count": args.strikes,
+        "include_underlying_quote": True,
+    }
+    if args.from_date:
+        kwargs["from_date"] = datetime.strptime(args.from_date, "%Y-%m-%d")
+    if args.to_date:
+        kwargs["to_date"] = datetime.strptime(args.to_date, "%Y-%m-%d")
+
+    resp = client.get_option_chain(args.symbol, **kwargs)
+    resp.raise_for_status()
+    chain = resp.json()
+    targets = [float(v) for v in args.target_pct.split(",")]
+    data = evaluate_calls(
+        chain,
+        targets,
+        max_expiries=args.expiries,
+        min_dte=args.min_dte,
+        max_dte=args.max_dte,
+    )
+
+    if args.raw:
+        emit(data, raw=True)
+        return
+
+    labels = [f"+{v:g}%" for v in targets]
+    print(f"\n  Options Eval: {args.symbol}  Underlying {fmt_currency(data.get('underlying_price'))}")
+    print("=" * 80)
+
+    if not data["outright_calls"] and not data["call_spreads"]:
+        print("  No evaluable call contracts found for the requested DTE/strike filters.")
+        print("  Try widening --min-dte/--max-dte or --strikes, or use --raw to inspect the Schwab chain.")
+        return
+
+    print("\n  Outright calls")
+    headers = ["Exp", "DTE", "Strike", "Debit", "BE", "Delta", "OI", "Spr%", "Scenarios"]
+    rows = []
+    for row in data["outright_calls"][: args.limit]:
+        rows.append([
+            row["expiry"],
+            row.get("dte"),
+            fmt_currency(row.get("strike")),
+            fmt_currency(row.get("debit")),
+            fmt_currency(row.get("breakeven")),
+            f"{row.get('delta'):.2f}" if row.get("delta") is not None else "N/A",
+            row.get("open_interest") or 0,
+            fmt_percent(row.get("spread_pct")),
+            _scenario_summary(row, labels),
+        ])
+    print(fmt_table(headers, rows, "<<>>>>><<"))
+
+    print("\n  Call spreads")
+    headers = ["Exp", "DTE", "Long/Short", "Debit", "MaxRet", "BE", "Scenarios"]
+    rows = []
+    for row in data["call_spreads"][: args.limit]:
+        rows.append([
+            row["expiry"],
+            row.get("dte"),
+            f"{row.get('long_strike'):g}/{row.get('short_strike'):g}",
+            fmt_currency(row.get("debit")),
+            fmt_percent(row.get("max_return_pct")),
+            fmt_currency(row.get("breakeven")),
+            _scenario_summary(row, labels),
+        ])
+    print(fmt_table(headers, rows, "<<>>>> <".replace(" ", "")))
 
 
 def cmd_auth(args):
@@ -414,11 +534,9 @@ def cmd_preview(args):
     resp = client.preview_order(account_hash, order_dict)
     resp.raise_for_status()
 
-    if args.raw:
-        emit(resp.json(), raw=True)
-    else:
+    if not args.raw:
         print("\n  Server Preview Response:")
-        emit(resp.json(), raw=True)
+    emit(resp.json(), raw=True)
 
 
 def cmd_cancel(args):
@@ -507,11 +625,20 @@ def cmd_history(args):
 
     # Shortcuts
     if args.daily:
+        kwargs["period_type"] = client.PriceHistory.PeriodType.YEAR
+        kwargs["period"] = client.PriceHistory.Period.ONE_YEAR
         kwargs["frequency_type"] = client.PriceHistory.FrequencyType.DAILY
+        kwargs["frequency"] = client.PriceHistory.Frequency.DAILY
     elif args.weekly:
+        kwargs["period_type"] = client.PriceHistory.PeriodType.YEAR
+        kwargs["period"] = client.PriceHistory.Period.ONE_YEAR
         kwargs["frequency_type"] = client.PriceHistory.FrequencyType.WEEKLY
+        kwargs["frequency"] = client.PriceHistory.Frequency.WEEKLY
     elif args.minute:
+        kwargs["period_type"] = client.PriceHistory.PeriodType.DAY
+        kwargs["period"] = client.PriceHistory.Period.ONE_DAY
         kwargs["frequency_type"] = client.PriceHistory.FrequencyType.MINUTE
+        kwargs["frequency"] = client.PriceHistory.Frequency.EVERY_MINUTE
 
     if args.period_type:
         kwargs["period_type"] = client.PriceHistory.PeriodType[args.period_type.upper()]
@@ -788,6 +915,26 @@ def main():
     p.add_argument("--include-quote", action="store_true", help="Include underlying quote data")
     _add_raw(p)
     p.set_defaults(func=cmd_options, _default_app="market")
+
+    # --- technical ---
+    p = subparsers.add_parser("technical", help="Intraday technical snapshot from Schwab history")
+    p.add_argument("symbol", help="Symbol")
+    _add_raw(p)
+    p.set_defaults(func=cmd_technical, _default_app="market")
+
+    # --- options-eval ---
+    p = subparsers.add_parser("options-eval", help="Evaluate calls and call spreads over target moves")
+    p.add_argument("symbol", help="Underlying symbol")
+    p.add_argument("--target-pct", default="30,50,70", help="Comma-separated target moves, e.g. 30,50,70")
+    p.add_argument("--strikes", type=int, default=20, help="Number of strikes around ATM")
+    p.add_argument("--expiries", type=int, default=6, help="Max expiries to evaluate")
+    p.add_argument("--min-dte", type=int, default=30, help="Minimum days to expiry")
+    p.add_argument("--max-dte", type=int, default=420, help="Maximum days to expiry")
+    p.add_argument("--limit", type=int, default=12, help="Rows per section")
+    p.add_argument("--from-date", help="First expiration date YYYY-MM-DD")
+    p.add_argument("--to-date", help="Last expiration date YYYY-MM-DD")
+    _add_raw(p)
+    p.set_defaults(func=cmd_options_eval, _default_app="market")
 
     # --- auth ---
     p = subparsers.add_parser("auth", help="Check authentication status")
