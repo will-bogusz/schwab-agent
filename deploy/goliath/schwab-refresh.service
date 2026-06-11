@@ -11,4 +11,4 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # browser with the trusted persistent profile completes login + consent
 # unattended; the keepalive re-logins proactively at 5 days so the 7-day
 # refresh-token cliff is never reached.
-ExecStart=/usr/bin/xvfb-run -a --server-args=-screen 0 1280x900x24 %h/.local/bin/uv run schwab-auth-keepalive --app all --browser-fallback --headed
+ExecStart=/usr/bin/xvfb-run -a --server-args="-screen 0 1280x900x24" %h/.local/bin/uv run schwab-auth-keepalive --app all --browser-fallback --headed
