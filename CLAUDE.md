@@ -13,23 +13,34 @@ Two apps with independent tokens:
 
 - Access tokens: 30 minutes (auto-refresh by schwab-py)
 - Refresh tokens: 7 days (re-authenticate after expiry)
-- Manual/cron refresh: `uv run schwab-refresh --app all`
-- Refresh plus browser fallback: `uv run schwab-auth-keepalive --app all --browser-fallback --headless`
+- Goliath is the default token authority when `config.json` uses
+  `https://goliath.tailffd98c.ts.net/callback`.
+- Local commands auto-refresh on goliath and sync rotated token files down.
+- Manual local sync: `uv run schwab token-sync --app all --refresh`
+- Manual/cron refresh on goliath: `uv run schwab-refresh --app all`
+- Refresh plus browser fallback on goliath:
+  `uv run schwab-auth-keepalive --app all --browser-fallback --headless`
 
 ### Re-authentication Steps
 
-1. Start SSH tunnel: `ssh -R 9000:localhost:8000 -N goliath`
-2. Start auth server: `cd schwab && uv run schwab-server`
-3. Visit `http://localhost:8000` and authenticate each app
-4. Callback URL: `https://goliath.tailffd98c.ts.net/callback`
+1. Visit `https://goliath.tailffd98c.ts.net/login/market`
+2. Complete Schwab login/consent for the market app
+3. Visit `https://goliath.tailffd98c.ts.net/login/trading`
+4. Complete Schwab login/consent for the trading app
+5. Verify locally with `uv run schwab token-sync --app all --refresh`
 
 ### Always-On Refresh
 
-Use `uv run schwab-refresh --app all` from the Schwab package directory to
-refresh both token files without running the OAuth web server. This is the
-right command for launchd, cron, or a systemd timer. On each successful refresh,
-the token timestamp is reset so the local 7-day refresh window tracks the newly
-issued Schwab refresh token.
+Use `uv run schwab-refresh --app all` from the Schwab package directory on
+goliath to refresh both token files without running a new OAuth login. This is
+the right command for launchd, cron, or a systemd timer. On each successful
+refresh, the token timestamp is reset so the 7-day refresh window tracks the
+newly issued Schwab refresh token.
+
+On local machines, use `uv run schwab token-sync --app all --refresh` or
+`uv run schwab-token-sync --app all --refresh`. This calls goliath's refresh
+endpoint, then copies the rotated token files down. Do not run a separate local
+refresh loop against copied tokens; that reintroduces token drift.
 
 Use `uv run schwab-auth-keepalive --app all --browser-fallback --headless` for
 the goliath timer. It refreshes first and only runs the Playwright login flow
@@ -52,6 +63,10 @@ Manual fallback test:
 uv run schwab-browser-auth --app all --headed
 ```
 
+With goliath authority enabled, a successful local browser fallback redirects to
+goliath and then syncs goliath's token file back down. If it cannot sync, the
+fallback exits as failed.
+
 For the goliath-hosted setup, see `deploy/goliath/`.
 
 ## App Selection
@@ -67,6 +82,7 @@ For the goliath-hosted setup, see `deploy/goliath/`.
 | `schwab quote <symbols>` | Session-aware Schwab quotes with regular/extended/reference/fundamental fields | market |
 | `schwab technical <symbol>` | Intraday technical snapshot: VWAP, ranges, volume, SMA/EMA | market |
 | `schwab options-eval <symbol>` | Outright call and call-spread scenarios with liquidity metrics | market |
+| `schwab token-sync` | Show/sync/refresh token files from goliath authority | market |
 | `schwab positions` | Account positions | trading |
 | `schwab balances` | Account balances | trading |
 | `schwab orders` | Show orders | trading |
@@ -112,6 +128,7 @@ schwab/
     ├── output.py             # Formatting helpers (fmt_table, fmt_currency, emit)
     ├── orders.py             # OrderBuilder wrapper + safety checks
     ├── cli.py                # 18-command CLI (entry point: schwab)
+    ├── remote_authority.py   # Goliath token authority sync/refresh
     ├── api.py                # Raw JSON order API (entry point: schwab-api)
     ├── browser_auth.py       # Browser fallback + secret writer
     └── server.py             # OAuth server (entry point: schwab-server)

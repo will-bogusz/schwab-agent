@@ -18,10 +18,18 @@ Schwab OAuth
   │     read-only level-one quote/account activity cache
   ├── browser login fallback
   │     refresh first, then Playwright login only if refresh fails
-  └── token store on goliath
-        /home/will/tmp/schwab/tokens_market.json
-        /home/will/tmp/schwab/tokens_trading.json
+  ├── token store on goliath
+  │     /home/will/tmp/schwab/tokens_market.json
+  │     /home/will/tmp/schwab/tokens_trading.json
+  └── local Mac clients
+        auto-refresh on goliath and sync copied token files down
 ```
+
+Goliath is the single token authority. Schwab rotates refresh tokens, so local
+machines should not independently refresh copied token files. With the goliath
+callback URL in `config.json`, local `schwab` commands automatically detect
+that they are not running on goliath, call goliath's `/refresh/<app>` endpoint
+when needed, and copy the rotated token file down over SSH.
 
 ## Migration
 
@@ -75,6 +83,15 @@ Schwab OAuth
    ls -l /home/will/tmp/trading/artifacts/schwab/live/
    ```
 
+7. From the local Mac, verify token authority and sync:
+
+   ```bash
+   cd ~/tmp/trading/schwab
+   uv run schwab token-sync --status
+   uv run schwab token-sync --app all --refresh
+   uv run schwab auth
+   ```
+
 ## Full Re-Auth Fallback
 
 The refresh timer should keep tokens alive indefinitely as long as Schwab keeps
@@ -85,10 +102,12 @@ flow, the timer runs the browser-login fallback automatically using:
 uv run schwab-auth-keepalive --app all --browser-fallback --headless
 ```
 
-For first-time setup or MFA troubleshooting, run it headed from an environment
-where a browser window is visible:
+For first-time setup or MFA troubleshooting, use the goliath login URLs directly
+or run the fallback headed from an environment where a browser window is visible:
 
 ```bash
+open https://goliath.tailffd98c.ts.net/login/market
+open https://goliath.tailffd98c.ts.net/login/trading
 uv run schwab-browser-auth --app all --headed
 ```
 

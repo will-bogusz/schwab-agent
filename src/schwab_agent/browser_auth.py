@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from . import config
+from . import remote_authority
 from .server import SCHWAB_AUTH_URL, refresh_tokens
 
 EnvMap = dict[str, str]
@@ -172,8 +173,6 @@ def _click_role_button(page: Page, names: list[str], timeout_ms: int = 1_000) ->
 
 def _looks_authenticated(page: Page) -> bool:
     try:
-        if re.search(r"/callback\b", page.url):
-            return True
         return page.get_by_text(re.compile(r"(App Authenticated|Tokens saved|Authenticated)", re.I)).first.is_visible(
             timeout=500
         )
@@ -331,6 +330,11 @@ def authenticate_app(
         while time.monotonic() < deadline:
             if _looks_authenticated(page):
                 browser.close()
+                if remote_authority.remote_enabled():
+                    synced = remote_authority.sync_from_authority(app_name)
+                    if synced.get("status") != "success":
+                        print(f"{app_name}: authenticated on authority, but local token sync failed: {synced.get('error')}")
+                        return False
                 print(f"{app_name}: authenticated")
                 return True
 

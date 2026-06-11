@@ -20,6 +20,7 @@ schwab-secrets = "schwab_agent.browser_auth:secrets_main"
 schwab-server = "schwab_agent.server:main"
 schwab-refresh = "schwab_agent.server:refresh_main"
 schwab-stream-cache = "schwab_agent.stream_cache:main"
+schwab-token-sync = "schwab_agent.remote_authority:main"
 
 [build-system]
 requires = ["hatchling"]

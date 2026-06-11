@@ -24,6 +24,7 @@ import httpx
 from flask import Flask, request, redirect, jsonify
 
 from . import config
+from . import remote_authority
 
 app = Flask(__name__)
 
@@ -274,6 +275,9 @@ def refresh_tokens(app_name: str) -> dict:
     """Refresh tokens for an app without requiring the Flask request path."""
     if app_name not in config.VALID_APPS:
         return {"status": "error", "app": app_name, "error": f"Invalid app. Must be one of: {config.VALID_APPS}"}
+
+    if remote_authority.remote_enabled():
+        return remote_authority.refresh_on_authority(app_name)
 
     tokens = load_tokens(app_name)
     if not tokens or not tokens.get("refresh_token"):

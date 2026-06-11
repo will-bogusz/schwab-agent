@@ -19,6 +19,7 @@ import argparse
 from datetime import datetime, timedelta
 
 from . import config
+from . import remote_authority
 from .client import get_client, get_account_hashes, resolve_account
 from .market import normalize_quote, normalized_quote_rows
 from .options_eval import evaluate_calls
@@ -412,6 +413,9 @@ def cmd_auth(args):
     """Check authentication status for all apps."""
     print("\n  Authentication Status")
     print("=" * 40)
+    authority = remote_authority.status_summary()
+    if authority["enabled"]:
+        print(f"  Token authority: {authority['authority_host']} ({authority['base_url']})")
 
     for app_name in config.VALID_APPS:
         token_path = config.get_token_path(app_name)
@@ -435,6 +439,34 @@ def cmd_auth(args):
 
         except Exception as e:
             print(f"  {app_name}: Error - {e}")
+
+
+def cmd_token_sync(args):
+    """Sync token files from the configured authority host."""
+    if args.status:
+        emit(remote_authority.status_summary(), raw=True)
+        return
+
+    apps = list(config.VALID_APPS) if args.app == "all" else [args.app]
+    ok = True
+    for app_name in apps:
+        result = (
+            remote_authority.refresh_on_authority(app_name)
+            if args.refresh
+            else remote_authority.sync_from_authority(app_name)
+        )
+        if args.raw:
+            emit(result, raw=True)
+        else:
+            print(f"{app_name}: {result.get('status')}")
+            if result.get("error"):
+                print(f"  {result['error']}")
+            if result.get("details"):
+                print(f"  {result['details']}")
+        ok = ok and result.get("status") == "success"
+
+    if not ok:
+        raise SystemExit(1)
 
 
 def cmd_accounts(args):
@@ -939,6 +971,14 @@ def main():
     # --- auth ---
     p = subparsers.add_parser("auth", help="Check authentication status")
     p.set_defaults(func=cmd_auth, _default_app="trading")
+
+    # --- token-sync ---
+    p = subparsers.add_parser("token-sync", help="Sync local token files from goliath authority")
+    p.add_argument("--app", choices=[*config.VALID_APPS, "all"], default="all")
+    p.add_argument("--refresh", action="store_true", help="Refresh on goliath before syncing")
+    p.add_argument("--status", action="store_true", help="Show token authority configuration")
+    _add_raw(p)
+    p.set_defaults(func=cmd_token_sync, _default_app="market")
 
     # --- accounts ---
     p = subparsers.add_parser("accounts", help="List linked accounts")

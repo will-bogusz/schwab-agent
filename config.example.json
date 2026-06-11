@@ -1,5 +1,13 @@
 {
-    "client_id": "YOUR_SCHWAB_APP_KEY",
-    "client_secret": "YOUR_SCHWAB_APP_SECRET",
-    "callback_url": "https://YOUR_NGROK_URL.ngrok-free.app/callback"
+  "callback_url": "https://goliath.tailffd98c.ts.net/callback",
+  "apps": {
+    "market": {
+      "client_id": "YOUR_MARKET_DATA_APP_KEY",
+      "client_secret": "YOUR_MARKET_DATA_APP_SECRET"
+    },
+    "trading": {
+      "client_id": "YOUR_TRADING_APP_KEY",
+      "client_secret": "YOUR_TRADING_APP_SECRET"
+    }
+  }
 }

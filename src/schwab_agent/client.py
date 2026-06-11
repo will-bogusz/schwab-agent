@@ -13,6 +13,7 @@ from pathlib import Path
 from schwab.auth import client_from_token_file
 
 from . import config
+from . import remote_authority
 
 
 def _normalize_token_file(token_path: Path):
@@ -42,7 +43,32 @@ def _normalize_token_file(token_path: Path):
 RECOVERY_COMMAND = "uv run schwab-auth-keepalive --app {app} --browser-fallback --headless"
 
 
+def _refresh_ok(result: dict | bool | None) -> bool:
+    """Return True only when refresh_tokens actually reports success."""
+    if isinstance(result, dict):
+        return result.get("status") == "success"
+    return bool(result)
+
+
+def _refresh_error(app: str, result: dict | bool | None) -> RuntimeError:
+    detail = ""
+    if isinstance(result, dict):
+        error = result.get("error")
+        details = result.get("details")
+        parts = [str(value) for value in (error, details) if value]
+        if parts:
+            detail = "\n" + "\n".join(parts)
+    return RuntimeError(_recovery_message(app) + detail)
+
+
 def _recovery_message(app: str) -> str:
+    if remote_authority.remote_enabled():
+        return (
+            f"Schwab token refresh failed for '{app}' via goliath authority. Recover with:\n"
+            f"  open {remote_authority.base_url()}/login/{app}\n"
+            f"Then verify:\n"
+            f"  uv run schwab-token-sync --app {app} --refresh"
+        )
     return (
         f"Schwab token refresh failed for '{app}'. Recover with:\n"
         f"  {RECOVERY_COMMAND.format(app=app)}"
@@ -52,6 +78,11 @@ def _recovery_message(app: str) -> str:
 def ensure_fresh_token(app: str, min_valid_seconds: int = 180) -> None:
     """Refresh the app token before API calls when it is expired or nearly so."""
     from .server import get_token_status, refresh_tokens
+
+    if remote_authority.remote_enabled():
+        synced = remote_authority.sync_from_authority(app)
+        if synced.get("status") not in {"success", "skipped"}:
+            raise _refresh_error(app, synced)
 
     status = get_token_status(app)
     if not status.get("exists"):
@@ -70,8 +101,9 @@ def ensure_fresh_token(app: str, min_valid_seconds: int = 180) -> None:
             pass
 
     if should_refresh:
-        if not refresh_tokens(app):
-            raise RuntimeError(_recovery_message(app))
+        result = remote_authority.refresh_on_authority(app) if remote_authority.remote_enabled() else refresh_tokens(app)
+        if not _refresh_ok(result):
+            raise _refresh_error(app, result)
 
 
 def _raw_client(app: str = config.DEFAULT_APP, asyncio: bool = False):
@@ -116,8 +148,13 @@ class ResilientClient:
             if getattr(resp, "status_code", None) == 401:
                 from .server import refresh_tokens
 
-                if not refresh_tokens(self._app):
-                    raise RuntimeError(_recovery_message(self._app))
+                result = (
+                    remote_authority.refresh_on_authority(self._app)
+                    if remote_authority.remote_enabled()
+                    else refresh_tokens(self._app)
+                )
+                if not _refresh_ok(result):
+                    raise _refresh_error(self._app, result)
                 self._rebuild()
                 retry_attr = getattr(self._client, name)
                 resp = retry_attr(*args, **kwargs)
