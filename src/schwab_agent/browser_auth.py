@@ -24,9 +24,20 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 
 from . import config
 from . import remote_authority
-from .server import SCHWAB_AUTH_URL, refresh_tokens
+from .server import SCHWAB_AUTH_URL, get_auth_timestamp, get_token_status, refresh_tokens
 
 EnvMap = dict[str, str]
+
+# Schwab refresh tokens hard-expire 7 days after full OAuth login. Re-login
+# proactively once the token is this old so the cliff is never reached.
+REAUTH_AFTER_DAYS = 5.0
+
+# Playwright's headless UA advertises HeadlessChrome, which Schwab's bot
+# detection can reject before the login form ever renders.
+DESKTOP_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def _config_dir_or_home() -> Path:
@@ -128,14 +139,24 @@ def build_auth_url(app_name: str) -> str:
     return f"{SCHWAB_AUTH_URL}?{urlencode(params)}"
 
 
+def _frames(page: Page):
+    """Main frame plus child frames — Schwab renders login inside an iframe
+    on some flow variants, so every lookup must scan all frames."""
+    try:
+        return [f for f in page.frames if not f.is_detached()]
+    except Exception:
+        return [page.main_frame]
+
+
 def _first_visible(page: Page, selectors: list[str]):
-    for selector in selectors:
-        loc = page.locator(selector).first
-        try:
-            if loc.count() and loc.is_visible(timeout=750):
-                return loc
-        except PlaywrightTimeoutError:
-            continue
+    for frame in _frames(page):
+        for selector in selectors:
+            try:
+                loc = frame.locator(selector).first
+                if loc.count() and loc.is_visible(timeout=750):
+                    return loc
+            except Exception:
+                continue
     return None
 
 
@@ -148,36 +169,65 @@ def _fill_first_visible(page: Page, selectors: list[str], value: str) -> bool:
 
 
 def _click_first_visible(page: Page, selectors: list[str], timeout_ms: int = 1_000) -> bool:
-    for selector in selectors:
-        loc = page.locator(selector).first
-        try:
-            if loc.count() and loc.is_visible(timeout=timeout_ms):
-                loc.click()
-                return True
-        except PlaywrightTimeoutError:
-            continue
+    for frame in _frames(page):
+        for selector in selectors:
+            try:
+                loc = frame.locator(selector).first
+                if loc.count() and loc.is_visible(timeout=timeout_ms):
+                    loc.click()
+                    return True
+            except Exception:
+                continue
     return False
 
 
 def _click_role_button(page: Page, names: list[str], timeout_ms: int = 1_000) -> bool:
-    for name in names:
-        try:
-            loc = page.get_by_role("button", name=re.compile(name, re.I)).first
-            if loc.count() and loc.is_visible(timeout=timeout_ms):
-                loc.click()
-                return True
-        except PlaywrightTimeoutError:
-            continue
+    for frame in _frames(page):
+        for name in names:
+            try:
+                loc = frame.get_by_role("button", name=re.compile(name, re.I)).first
+                if loc.count() and loc.is_visible(timeout=timeout_ms):
+                    loc.click()
+                    return True
+            except Exception:
+                continue
     return False
 
 
 def _looks_authenticated(page: Page) -> bool:
+    # The success page is served by our own OAuth server at /callback.
+    try:
+        if "/callback" in (page.url or "") and "code=" in page.url:
+            return True
+    except Exception:
+        pass
     try:
         return page.get_by_text(re.compile(r"(App Authenticated|Tokens saved|Authenticated)", re.I)).first.is_visible(
             timeout=500
         )
-    except PlaywrightTimeoutError:
+    except Exception:
         return False
+
+
+def debug_dir() -> Path:
+    return default_profile_dir().parent / "debug"
+
+
+def _capture_debug(page: Page, app_name: str, reason: str) -> None:
+    """Persist screenshot + URL + HTML so a failed headless run is diagnosable."""
+    try:
+        out = debug_dir()
+        out.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base = out / f"{app_name}_{reason}_{stamp}"
+        page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        info = [f"url: {page.url}", f"title: {page.title()}", ""]
+        for frame in _frames(page):
+            info.append(f"frame: {frame.url}")
+        base.with_suffix(".txt").write_text("\n".join(info) + "\n\n" + page.content()[:50_000])
+        print(f"{app_name}: debug capture -> {base}.png/.txt")
+    except Exception as exc:
+        print(f"{app_name}: debug capture failed: {exc}")
 
 
 def _maybe_fill_login(page: Page, username: str, password: str) -> bool:
@@ -322,13 +372,19 @@ def authenticate_app(
             str(profile_dir),
             headless=headless,
             viewport={"width": 1280, "height": 900},
-            args=["--disable-dev-shm-usage"],
+            user_agent=DESKTOP_UA if headless else None,
+            args=["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         page = browser.pages[0] if browser.pages else browser.new_page()
         page.goto(auth_url, wait_until="domcontentloaded")
 
         while time.monotonic() < deadline:
             if _looks_authenticated(page):
+                # Give the callback page a moment to finish the token exchange.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10_000)
+                except PlaywrightTimeoutError:
+                    pass
                 browser.close()
                 if remote_authority.remote_enabled():
                     synced = remote_authority.sync_from_authority(app_name)
@@ -343,6 +399,7 @@ def authenticate_app(
                 if _maybe_fill_mfa(page, mfa_code or os.environ.get("SCHWAB_MFA_CODE")):
                     page.wait_for_load_state("domcontentloaded", timeout=10_000)
                 elif headless:
+                    _capture_debug(page, app_name, "mfa")
                     browser.close()
                     print(f"{app_name}: MFA required; rerun headed or provide SCHWAB_MFA_CODE.")
                     return False
@@ -356,6 +413,7 @@ def authenticate_app(
                 pass
             time.sleep(1)
 
+        _capture_debug(page, app_name, "timeout")
         browser.close()
     print(f"{app_name}: browser auth timed out after {timeout_seconds}s")
     return False
@@ -394,6 +452,31 @@ def main() -> None:
     raise SystemExit(0 if ok else 1)
 
 
+def _refresh_token_age_days(app_name: str) -> float | None:
+    authed = get_auth_timestamp(app_name)
+    if authed:
+        return (time.time() - authed) / 86400
+    status = get_token_status(app_name)
+    age = status.get("refresh_age_days")
+    return float(age) if age is not None else None
+
+
+def _write_health(results: dict[str, dict]) -> None:
+    """Persist keepalive outcomes so status tooling and local CLIs can warn."""
+    import json
+
+    path = config.get_auth_health_path()
+    payload = {
+        "updated": int(time.time()),
+        "updated_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "apps": results,
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=2))
+    except OSError as exc:
+        print(f"warning: could not write {path}: {exc}")
+
+
 def keepalive_main() -> None:
     parser = argparse.ArgumentParser(description="Refresh Schwab tokens, with optional browser-login fallback")
     parser.add_argument("--app", choices=[*config.VALID_APPS, "all"], default="all")
@@ -401,6 +484,12 @@ def keepalive_main() -> None:
     parser.add_argument("--secrets", type=Path, default=default_secrets_path())
     parser.add_argument("--profile-dir", type=Path, default=default_profile_dir())
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument(
+        "--reauth-after-days",
+        type=float,
+        default=REAUTH_AFTER_DAYS,
+        help="Proactively re-login once the refresh token is this old (7-day hard expiry)",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--headless", action="store_true")
     mode.add_argument("--headed", action="store_true")
@@ -410,30 +499,50 @@ def keepalive_main() -> None:
     if args.headed:
         headless = False
 
-    failed_apps: list[str] = []
+    health: dict[str, dict] = {}
+    need_login: list[str] = []
     for app_name in _app_list(args.app):
         result = refresh_tokens(app_name)
+        age = _refresh_token_age_days(app_name)
+        entry = {"refresh_token_age_days": round(age, 2) if age is not None else None}
         if result.get("status") == "success":
             print(f"{app_name}: refreshed ({result.get('expires_in')}s access token)")
+            entry["refresh"] = "ok"
+            # Refreshing works today, but the 7-day window is finite —
+            # re-login proactively instead of waiting for the cliff.
+            if args.browser_fallback and age is not None and age >= args.reauth_after_days:
+                print(f"{app_name}: refresh token is {age:.1f}d old; proactive re-login")
+                need_login.append(app_name)
         else:
             print(f"{app_name}: refresh failed - {result.get('error')}")
-            failed_apps.append(app_name)
+            entry["refresh"] = "failed"
+            entry["error"] = str(result.get("error"))
+            need_login.append(app_name)
+        health[app_name] = entry
 
-    if not failed_apps:
+    if not need_login:
+        _write_health(health)
         raise SystemExit(0)
 
     if not args.browser_fallback:
+        _write_health(health)
         raise SystemExit(1)
 
     ok = True
-    for app_name in failed_apps:
-        ok = authenticate_app(
+    for app_name in need_login:
+        success = authenticate_app(
             app_name,
             secrets_path=args.secrets,
             profile_dir=args.profile_dir,
             headless=headless,
             timeout_seconds=args.timeout,
-        ) and ok
+        )
+        health[app_name]["browser_auth"] = "ok" if success else "failed"
+        if success:
+            health[app_name]["refresh_token_age_days"] = 0.0
+        ok = success and ok
+
+    _write_health(health)
     raise SystemExit(0 if ok else 1)
 
 

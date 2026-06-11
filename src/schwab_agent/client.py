@@ -75,35 +75,72 @@ def _recovery_message(app: str) -> str:
     )
 
 
+# Per-process memo: once a token is known fresh, skip all checks until just
+# before its access expiry. Cuts the previous scp-per-client-call pattern to
+# at most one authority round-trip per process per token lifetime.
+_FRESH_UNTIL: dict[str, float] = {}
+
+
+def _access_valid_for(status: dict) -> float:
+    """Seconds until access-token expiry per local token state (or 0)."""
+    access_expires = status.get("access_expires")
+    if not access_expires:
+        return 0.0
+    try:
+        # Stored without timezone; compare in local time like server.py.
+        import datetime as _dt
+
+        return _dt.datetime.fromisoformat(access_expires).timestamp() - time.time()
+    except Exception:
+        return 0.0
+
+
 def ensure_fresh_token(app: str, min_valid_seconds: int = 180) -> None:
-    """Refresh the app token before API calls when it is expired or nearly so."""
+    """Make sure the local token file is usable, with minimal authority traffic.
+
+    Order matters for latency: check the local file first and return without
+    any network I/O when it is still valid. Only sync/refresh via goliath when
+    the local token is missing, stale, or near expiry.
+    """
     from .server import get_token_status, refresh_tokens
 
+    now = time.time()
+    if _FRESH_UNTIL.get(app, 0.0) > now:
+        return
+
+    def _fresh(status: dict) -> bool:
+        return (
+            status.get("exists")
+            and status.get("status") in {"valid", "unknown_expiry"}
+            and _access_valid_for(status) > min_valid_seconds
+        )
+
+    status = get_token_status(app)
+    if _fresh(status):
+        _FRESH_UNTIL[app] = now + min(_access_valid_for(status) - min_valid_seconds, 300.0)
+        return
+
+    # Local token stale or missing. The authority may already hold a fresher
+    # copy (goliath refreshes on its own schedule) — pull it before asking for
+    # a new refresh.
     if remote_authority.remote_enabled():
         synced = remote_authority.sync_from_authority(app)
         if synced.get("status") not in {"success", "skipped"}:
             raise _refresh_error(app, synced)
+        status = get_token_status(app)
+        if _fresh(status):
+            _FRESH_UNTIL[app] = now + min(_access_valid_for(status) - min_valid_seconds, 300.0)
+            return
 
-    status = get_token_status(app)
     if not status.get("exists"):
         raise RuntimeError(_recovery_message(app))
 
-    should_refresh = status.get("status") in {"needs_refresh", "refresh_expired"}
-    access_expires = status.get("access_expires")
-    if access_expires:
-        try:
-            # Stored without timezone; compare in local time like server.py.
-            import datetime as _dt
-
-            expires_at = _dt.datetime.fromisoformat(access_expires).timestamp()
-            should_refresh = should_refresh or expires_at - time.time() < min_valid_seconds
-        except Exception:
-            pass
-
-    if should_refresh:
-        result = remote_authority.refresh_on_authority(app) if remote_authority.remote_enabled() else refresh_tokens(app)
-        if not _refresh_ok(result):
-            raise _refresh_error(app, result)
+    result = remote_authority.refresh_on_authority(app) if remote_authority.remote_enabled() else refresh_tokens(app)
+    if not _refresh_ok(result):
+        raise _refresh_error(app, result)
+    status = get_token_status(app)
+    if _fresh(status):
+        _FRESH_UNTIL[app] = now + min(_access_valid_for(status) - min_valid_seconds, 300.0)
 
 
 def _raw_client(app: str = config.DEFAULT_APP, asyncio: bool = False):
@@ -148,6 +185,7 @@ class ResilientClient:
             if getattr(resp, "status_code", None) == 401:
                 from .server import refresh_tokens
 
+                _FRESH_UNTIL.pop(self._app, None)
                 result = (
                     remote_authority.refresh_on_authority(self._app)
                     if remote_authority.remote_enabled()
@@ -163,6 +201,12 @@ class ResilientClient:
         return wrapped
 
 
+# One client per (app, flavor) per process — callers in per-symbol loops get
+# the same underlying httpx session instead of re-running auth checks and
+# connection setup for every symbol.
+_CLIENT_CACHE: dict[tuple, object] = {}
+
+
 def get_client(app: str = config.DEFAULT_APP, asyncio: bool = False, resilient: bool = True):
     """
     Get an authenticated Schwab client for the specified app.
@@ -172,11 +216,14 @@ def get_client(app: str = config.DEFAULT_APP, asyncio: bool = False, resilient: 
         asyncio: If True, returns an async client.
 
     Returns:
-        schwab.client.Client or schwab.client.AsyncClient.
+        schwab.client.Client or schwab.client.AsyncClient (cached per process).
     """
-    if resilient:
-        return ResilientClient(app, asyncio=asyncio)
-    return _raw_client(app, asyncio=asyncio)
+    key = (app, asyncio, resilient)
+    client = _CLIENT_CACHE.get(key)
+    if client is None:
+        client = ResilientClient(app, asyncio=asyncio) if resilient else _raw_client(app, asyncio=asyncio)
+        _CLIENT_CACHE[key] = client
+    return client
 
 
 def get_account_hashes(client) -> list[dict]:

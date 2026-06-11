@@ -78,6 +78,33 @@ def get_basic_auth(client_id: str, client_secret: str) -> str:
     return f"Basic {encoded}"
 
 
+def load_auth_meta() -> dict:
+    path = config.get_auth_meta_path()
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def record_full_auth(app_name: str, timestamp: int | None = None) -> None:
+    """Record a real browser/OAuth login. Refreshes must never call this."""
+    meta = load_auth_meta()
+    meta[app_name] = {"auth_timestamp": int(timestamp or time.time())}
+    path = config.get_auth_meta_path()
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def get_auth_timestamp(app_name: str) -> int | None:
+    """Unix time of the last full OAuth login, or None if never recorded."""
+    entry = load_auth_meta().get(app_name) or {}
+    ts = entry.get("auth_timestamp")
+    return int(ts) if ts else None
+
+
 def get_token_status(app_name: str) -> dict:
     """Get token status for an app."""
     tokens = load_tokens(app_name)
@@ -90,20 +117,27 @@ def get_token_status(app_name: str) -> dict:
         created = raw["creation_timestamp"]
         expires_in = tokens.get("expires_in", 1800)
         access_expires = datetime.fromtimestamp(created + expires_in)
-        refresh_expires = datetime.fromtimestamp(created + 7 * 24 * 3600)
 
+        # Schwab refresh tokens hard-expire 7 days after the original OAuth
+        # login; refreshing the access token does NOT extend that window. Use
+        # the recorded full-auth time, falling back to creation_timestamp for
+        # tokens predating auth_meta.json (that fallback over-estimates the
+        # window when refreshes have happened since login).
+        authed = get_auth_timestamp(app_name) or created
+        refresh_expires = datetime.fromtimestamp(authed + 7 * 24 * 3600)
+        refresh_age_days = (time.time() - authed) / 86400
+
+        base = {
+            "access_expires": access_expires.isoformat(),
+            "refresh_expires": refresh_expires.isoformat(),
+            "refresh_age_days": round(refresh_age_days, 2),
+        }
         if datetime.now() > refresh_expires:
-            return {"exists": True, "valid": False, "status": "refresh_expired"}
+            return {"exists": True, "valid": False, "status": "refresh_expired", **base}
         elif datetime.now() > access_expires:
-            return {"exists": True, "valid": True, "status": "needs_refresh"}
+            return {"exists": True, "valid": True, "status": "needs_refresh", **base}
         else:
-            return {
-                "exists": True,
-                "valid": True,
-                "status": "valid",
-                "access_expires": access_expires.isoformat(),
-                "refresh_expires": refresh_expires.isoformat(),
-            }
+            return {"exists": True, "valid": True, "status": "valid", **base}
 
     return {"exists": True, "valid": True, "status": "unknown_expiry"}
 
@@ -237,6 +271,7 @@ def callback():
     if resp.status_code == 200:
         tokens = resp.json()
         save_tokens(app_name, tokens)
+        record_full_auth(app_name)
 
         return f"""
         <!DOCTYPE html>
@@ -298,17 +333,14 @@ def refresh_tokens(app_name: str) -> dict:
 
     if resp.status_code == 200:
         new_tokens = resp.json()
-        # Schwab returns a fresh refresh token on refresh. Reset the timestamp so
-        # local status tracks the new 7-day refresh window, not the original
-        # browser-auth time. If Schwab ever omits refresh_token, keep the prior
-        # token but do not pretend the refresh window was extended.
-        if new_tokens.get("refresh_token"):
-            creation_timestamp = int(time.time())
-        else:
-            raw = load_tokens_raw(app_name) or {}
+        # creation_timestamp tracks the latest token issuance so access-token
+        # expiry math stays correct. The 7-day refresh window is tracked
+        # separately in auth_meta.json (written only on full OAuth login) —
+        # Schwab does not extend the refresh window on refresh, even when the
+        # response echoes a refresh_token.
+        if not new_tokens.get("refresh_token"):
             new_tokens["refresh_token"] = tokens["refresh_token"]
-            creation_timestamp = raw.get("creation_timestamp")
-        save_tokens(app_name, new_tokens, creation_timestamp=creation_timestamp)
+        save_tokens(app_name, new_tokens, creation_timestamp=int(time.time()))
         return {"status": "success", "app": app_name, "expires_in": new_tokens.get("expires_in")}
     return {"status": "error", "app": app_name, "error": "Refresh failed", "details": resp.text}
 

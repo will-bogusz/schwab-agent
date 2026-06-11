@@ -65,6 +65,22 @@ def get_token_path(app: str = DEFAULT_APP) -> Path:
     return find_config_dir() / f"tokens_{app}.json"
 
 
+def get_auth_meta_path() -> Path:
+    """Sidecar recording the last full-OAuth login time per app.
+
+    Lives outside the token files because schwab-py rewrites those on its own
+    refreshes and would drop unknown fields. Only the OAuth callback (a real
+    browser login) writes this; refreshes never touch it, so the 7-day
+    refresh-token window can be computed honestly.
+    """
+    return find_config_dir() / "auth_meta.json"
+
+
+def get_auth_health_path() -> Path:
+    """Keepalive health report consumed by status tooling and local CLIs."""
+    return find_config_dir() / "auth_health.json"
+
+
 def load_config() -> dict:
     """Load and validate the configuration file."""
     config_path = get_config_path()
