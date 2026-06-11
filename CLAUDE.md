@@ -12,14 +12,21 @@ Two apps with independent tokens:
 | `trading` | `tokens_trading.json` |
 
 - Access tokens: 30 minutes (auto-refresh by schwab-py)
-- Refresh tokens: 7 days (re-authenticate after expiry)
+- Refresh tokens: hard-expire 7 days after the ORIGINAL full OAuth login.
+  Refreshes do NOT extend that window. The true login time is tracked in
+  `auth_meta.json` (stamped by `/callback`); `/status` reports honest
+  `refresh_age_days` / `refresh_expires` from it.
+- The goliath keepalive timer (00:15 / 12:15) refreshes access tokens and
+  proactively re-runs the full browser login once a refresh token is ≥5 days
+  old, so the 7-day cliff is never reached. Health: `auth_health.json`.
 - Goliath is the default token authority when `config.json` uses
   `https://goliath.tailffd98c.ts.net/callback`.
 - Local commands auto-refresh on goliath and sync rotated token files down.
 - Manual local sync: `uv run schwab token-sync --app all --refresh`
 - Manual/cron refresh on goliath: `uv run schwab-refresh --app all`
-- Refresh plus browser fallback on goliath:
-  `uv run schwab-auth-keepalive --app all --browser-fallback --headless`
+- Refresh plus browser fallback on goliath (must be headed — Akamai blocks
+  headless Chromium; the systemd unit wraps it in xvfb-run):
+  `uv run schwab-auth-keepalive --app all --browser-fallback --headed`
 
 ### Re-authentication Steps
 
@@ -31,20 +38,18 @@ Two apps with independent tokens:
 
 ### Always-On Refresh
 
-Use `uv run schwab-refresh --app all` from the Schwab package directory on
-goliath to refresh both token files without running a new OAuth login. This is
-the right command for launchd, cron, or a systemd timer. On each successful
-refresh, the token timestamp is reset so the 7-day refresh window tracks the
-newly issued Schwab refresh token.
+The goliath systemd timer (`schwab-refresh.timer`, 00:15 / 12:15) runs
+`schwab-auth-keepalive --app all --browser-fallback --headed` under xvfb-run.
+It refreshes access tokens, then proactively runs the full Playwright login
+for any app whose refresh token is ≥5 days old (`--reauth-after-days`), and
+writes `auth_health.json`. Refreshing does NOT extend Schwab's 7-day refresh
+window — only a full login does, which is why the proactive re-login exists.
+Failed logins dump screenshot + URL + HTML to `.auth/debug/`.
 
 On local machines, use `uv run schwab token-sync --app all --refresh` or
 `uv run schwab-token-sync --app all --refresh`. This calls goliath's refresh
 endpoint, then copies the rotated token files down. Do not run a separate local
 refresh loop against copied tokens; that reintroduces token drift.
-
-Use `uv run schwab-auth-keepalive --app all --browser-fallback --headless` for
-the goliath timer. It refreshes first and only runs the Playwright login flow
-when refresh fails.
 
 ### Browser Login Fallback
 

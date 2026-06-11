@@ -40,7 +40,7 @@ def _normalize_token_file(token_path: Path):
     tmp_path.replace(token_path)
 
 
-RECOVERY_COMMAND = "uv run schwab-auth-keepalive --app {app} --browser-fallback --headless"
+RECOVERY_COMMAND = "uv run schwab-auth-keepalive --app {app} --browser-fallback --headed"
 
 
 def _refresh_ok(result: dict | bool | None) -> bool:
