@@ -21,12 +21,30 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 import httpx
-from flask import Flask, request, redirect, jsonify
+from flask import Flask, abort, request, redirect, jsonify
 
 from . import config
 from . import remote_authority
 
 app = Flask(__name__)
+
+# Tailscale Funnel exposes the whole 443 listener publicly (the funnel flag is
+# per host:port, not per path), so the app itself must gate access. Only the
+# OAuth callback needs to be public — Schwab redirects the user's browser
+# there. Tailnet clients are identified by the identity headers Tailscale
+# Serve injects; funnel (public) traffic never carries them.
+PUBLIC_PATHS = {"/callback"}
+
+
+@app.before_request
+def _restrict_to_tailnet():
+    if request.path in PUBLIC_PATHS:
+        return
+    if request.headers.get("Tailscale-User-Login"):
+        return  # tailnet client via Tailscale Serve
+    if request.remote_addr == "127.0.0.1" and not request.headers.get("X-Forwarded-For"):
+        return  # direct local access (goliath itself or an ssh tunnel)
+    abort(404)
 
 SCHWAB_AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize"
 SCHWAB_TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
