@@ -6,6 +6,10 @@ Type=oneshot
 WorkingDirectory=%h/tmp/schwab
 Environment=SCHWAB_AGENT_DIR=%h/tmp/schwab
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# goliath has no NVIDIA GPU; the orphaned libEGL_nvidia vendor lib segfaults
+# Xvfb during GLX/EGL init (broke 2026-09-02 on xserver 21.1.12-1ubuntu1.6).
+# Pin EGL to mesa so GLX still works for Chromium.
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
 # Headed under Xvfb, NOT --headless: Schwab's Akamai edge rejects headless
 # Chromium ("Access Denied") before the login form renders. The headed
 # browser with the trusted persistent profile completes login + consent
